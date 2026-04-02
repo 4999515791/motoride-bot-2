@@ -1,0 +1,13 @@
+# Sessão do browser (específica por máquina)
+perfil-browser/
+
+# Dados locais
+data/leads.json
+logs/
+
+# Node
+node_modules/
+
+# Screenshots de debug
+*.png
+.env

@@ -1,0 +1,897 @@
+const { chromium } = require('playwright');
+const Anthropic = require('@anthropic-ai/sdk');
+require('dotenv').config();
+
+const fs   = require('fs');
+const path = require('path');
+const log  = require('./modules/logger');
+const https = require('https');
+
+// ── Config ───────────────────────────────────────────────
+const DRY_RUN      = process.env.DRY_RUN === 'true';
+const MAX_POR_CICLO = parseInt(process.env.MAX_POR_CICLO  || '5', 10);
+const DELAY_MIN    = parseInt(process.env.DELAY_MIN_MS    || '2000', 10);
+const DELAY_MAX    = parseInt(process.env.DELAY_MAX_MS    || '7000', 10);
+const CDP_PORT     = process.env.CDP_PORT || '9222';
+const BOT_ID       = process.env.BOT_ID   || 'facebook1';
+const BOT_NAME     = process.env.BOT_NAME || (BOT_ID === 'facebook2' ? 'Facebook 2 — 49998351418' : 'Facebook 1 — barcaroariela@gmail.com');
+
+// ── Claude ───────────────────────────────────────────────
+const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// ── CRM (Lovable Edge Functions) ─────────────────────────
+const SUPABASE_URL     = process.env.SUPABASE_URL;
+const BOT_SECRET_TOKEN = process.env.BOT_SECRET_TOKEN;
+
+// Chama uma Edge Function do Lovable via HTTPS
+async function chamarEdgeFunction(nome, body) {
+  if (!SUPABASE_URL || !BOT_SECRET_TOKEN) return null;
+  return new Promise((resolve) => {
+    const data = JSON.stringify(body);
+    const url  = new URL(`${SUPABASE_URL}/functions/v1/${nome}`);
+    const options = {
+      hostname: url.hostname,
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-bot-token': BOT_SECRET_TOKEN,
+        'Content-Length': Buffer.byteLength(data),
+      },
+    };
+    const req = https.request(options, (res) => {
+      let raw = '';
+      res.on('data', chunk => raw += chunk);
+      res.on('end', () => {
+        try { resolve(JSON.parse(raw)); } catch { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.write(data);
+    req.end();
+  });
+}
+
+// Lê configuração do bot via Edge Function (service_role interno — RLS seguro)
+async function lerConfiguracaoCRM() {
+  if (!SUPABASE_URL || !BOT_SECRET_TOKEN) return null;
+  const result = await chamarEdgeFunction('bot-get-config', { bot_id: BOT_ID, bot_type: 'messaging' });
+  return (result && result.config) ? result.config : null;
+}
+
+// Envia heartbeat ao CRM — CRM sabe que o bot está vivo
+async function enviarHeartbeat(configId) {
+  if (!SUPABASE_URL || !BOT_SECRET_TOKEN || !configId) return;
+  await chamarEdgeFunction('bot-heartbeat', {
+    bot_id:    BOT_ID,
+    config_id: configId,
+    bot_type:  'messaging',
+    timestamp: new Date().toISOString(),
+  });
+}
+
+// ── Extrai número de WhatsApp de uma mensagem ────────────
+function extrairWhatsApp(texto) {
+  if (!texto) return null;
+  // Padrões: (49) 99951-5791 | 49999515791 | +5549999515791 | 99951-5791
+  const match = texto.match(/(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?\d{4,5}[-\s]?\d{4}/);
+  if (!match) return null;
+  const digits = match[0].replace(/\D/g, '');
+  if (digits.length < 8 || digits.length > 13) return null;
+  return digits;
+}
+
+// ── Cria lead no CRM via Edge Function (bot-create-lead) ─────────────────────
+async function sincronizarLeadCRM(convId, compradorNome, veiculo, historico, telefone) {
+  if (!SUPABASE_URL || !BOT_SECRET_TOKEN) return;
+
+  const nomeReal   = compradorNome.replace(/_/g, ' ').replace(/\d+/g, '').trim() || 'Lead Marketplace';
+  const interesse  = veiculo ? `Comprar ${veiculo.marca} ${veiculo.modelo} ${veiculo.ano}` : 'comprar moto';
+  const notas      = historico
+    ? `[Facebook Marketplace]\n` + historico.slice(-10).map(m => `${m.de === 'eu' ? 'Vendedor' : 'Cliente'}: ${m.texto}`).join('\n')
+    : null;
+
+  const result = await chamarEdgeFunction('bot-create-lead', {
+    name:            nomeReal,
+    phone:           telefone,
+    interest:        interesse,
+    source:          'marketplace-facebook',
+    seller_name:     'João',
+    notes:           notas,
+    conv_id:         convId,
+    vehicle_label:   veiculo ? `${veiculo.marca} ${veiculo.modelo} ${veiculo.ano}` : null,
+    local_vehicle_id: veiculo?.id || null,  // ex: "v7" — CRM usa pra vincular ao stock_vehicles
+  });
+
+  if (!result || result.error) {
+    log.warn(`[CRM] Falha ao criar lead: ${result?.error || 'sem resposta'}`);
+    return null;
+  }
+
+  const clientId = result.id || result.client_id || null;
+  log.ok(`[CRM] Lead criado: ${nomeReal} → ${clientId}`);
+  return clientId;
+}
+
+// ── Arquivos de dados ────────────────────────────────────
+const VEHICLES_FILE = path.join(__dirname, 'data', 'vehicles.json');
+const LEADS_FILE    = path.join(__dirname, 'data', 'leads.json');
+
+function loadJSON(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return {}; }
+}
+function saveJSON(file, data) {
+  fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
+}
+
+// ── Utilitários ──────────────────────────────────────────
+
+// Delay aleatório entre DELAY_MIN e DELAY_MAX ms
+function delayAleatorio() {
+  const ms = Math.floor(Math.random() * (DELAY_MAX - DELAY_MIN + 1)) + DELAY_MIN;
+  return new Promise(r => setTimeout(r, ms));
+}
+
+// Fingerprint normalizado: ignora maiúsculas, espaços extras, pontuação irrelevante
+function fingerprint(msg) {
+  return (msg || '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+
+async function responderFallback(veiculo, historico, mensagem) {
+  const v = veiculo;
+  const hist = historico || [];
+  const nMsgsCliente = hist.filter(m => m.de === 'cliente').length;
+
+  // Mensagem de voz — pede para mandar em texto
+  if (mensagem === '[áudio]') {
+    const nome = `o ${v.marca} ${v.modeloMkt || v.modelo} ${v.ano}`;
+    return `Vi que você mandou um áudio, mas aqui no chat não consigo ouvir. Pode me contar em texto o que quer saber sobre ${nome}?`;
+  }
+
+  // Analisa o que já foi coletado no histórico
+  const todasTextos  = hist.map(m => m.texto).join(' ');
+  const clienteTextos = hist.filter(m => m.de === 'cliente').map(m => m.texto).join(' ');
+  const temForma      = /\b(financ|à vista|avista|troca|trocar|entrada)\b/i.test(todasTextos);
+  // Verifica se o CLIENTE mandou o número dele (não conta o número da loja que nós enviamos)
+  const telCliente    = extrairWhatsApp(clienteTextos);
+  const temWppCliente = telCliente !== null;
+
+  // Monta instrução adaptada ao estágio da conversa
+  let instrucao;
+  if (nMsgsCliente === 0) {
+    instrucao = `PRIMEIRO CONTATO. Confirme que o veículo está disponível e pergunte a cidade do cliente. Máximo 2 frases curtas. Não peça WhatsApp ainda.`;
+  } else if (!temForma) {
+    instrucao = `Já respondeu o contato inicial. Agora pergunte de forma natural como o cliente pretende comprar: financiado, à vista ou tem troca. 1 pergunta apenas.`;
+  } else if (!temWppCliente) {
+    instrucao = `Já sabe a forma de compra. ${
+      /financ/i.test(todasTextos)
+        ? 'Diga que trabalha com aprovação facilitada inclusive para negativados. '
+        : ''
+    }OBRIGATÓRIO: inclua o número da loja na resposta: (49) 998351418. TAMBÉM peça o WhatsApp do cliente para poder chamá-lo: "me manda seu WhatsApp também". Máximo 2 frases.`;
+  } else {
+    instrucao = `Cliente já mandou o WhatsApp dele (${telCliente}). Confirme que vai chamar por lá e encerre a conversa do Marketplace de forma simpática. 1 frase.`;
+  }
+
+  const system = `Você é João, vendedor da MotoRide em Curitibanos-SC. Tom natural, humano, direto — sem parecer robô, sem emojis, sem asteriscos, sem textos longos.
+
+VEÍCULO EM NEGOCIAÇÃO:
+- ${v.marca} ${v.modeloMkt || v.modelo} ${v.versao || ''} ${v.ano}
+- Preço: R$ ${Number(v.preco).toLocaleString('pt-BR')}
+- KM: ${v.quilometragem}
+- Cor: ${v.cor}
+- Mecânica: ${v.estadoMecanico}
+- Estética: ${v.estadoEstetico}
+- Diferenciais: ${v.diferenciais}
+- Aceita troca: ${v.aceitaTroca ? 'sim' : 'não'}
+- Financiamento: ${v.financiamento}
+${v.observacoes ? '- Obs: ' + v.observacoes : ''}
+
+OBJETIVO: Engajar → Coletar cidade e forma de compra → Direcionar para WhatsApp (49) 998351418 → Converter.
+
+REGRAS:
+- Máximo 2 frases por resposta
+- Nunca fazer mais de 1 pergunta por vez
+- Não parecer formulário
+- Não inventar informações do veículo
+- Nunca usar emojis, asteriscos ou markdown
+- Sempre conduzir para o próximo passo
+
+INSTRUÇÃO PARA ESTA MENSAGEM: ${instrucao}`;
+
+  const msgs = hist.slice(-10).map(m => ({ role: m.de === 'eu' ? 'assistant' : 'user', content: m.texto }));
+  msgs.push({ role: 'user', content: mensagem });
+
+  const res = await claude.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 120,
+    system,
+    messages: msgs
+  });
+  let resposta = res.content[0].text.trim().replace(/\*\*/g, '').replace(/\*/g, '').replace(/[🏍🚗🚙🏎🤝👍👋🔥💪✅📱🙌]/gu, '').trim();
+
+  // Garante que o número da loja está na resposta quando o estágio é WhatsApp
+  if (!temWppCliente && /whatsapp/i.test(resposta) && !/998351418/.test(resposta)) {
+    resposta += ' (49) 998351418';
+  }
+
+  return resposta;
+}
+
+async function responder(veiculo, historico, mensagem) {
+  return responderFallback(veiculo, historico, mensagem);
+}
+
+function responderForaDeEstoque(vehicleHint, ativos) {
+  const mencionado = vehicleHint ? vehicleHint.trim() : 'esse veículo';
+  const lista = ativos.slice(0, 4)
+    .map(v => `${v.marca} ${v.modeloMkt || v.modelo} ${v.ano} por R$ ${Number(v.preco).toLocaleString('pt-BR')}`)
+    .join(', ');
+  return `Infelizmente o ${mencionado} não temos mais em estoque. Só esse modelo te interessa ou posso te mostrar outros que temos disponíveis? Temos: ${lista}.`;
+}
+
+// ── Verifica se deve enviar follow-up (cliente sumiu após nossa resposta) ──────
+function deveFollowUp(lead) {
+  if (!lead.ultimaAtividade) return false;
+  if (!lead.historico || lead.historico.length === 0) return false;
+  if (lead.followUpEnviado) return false; // já mandamos follow-up nesse silêncio
+
+  // Última mensagem do histórico deve ser nossa (esperando resposta do cliente)
+  const ultimaNoHistorico = lead.historico[lead.historico.length - 1];
+  if (ultimaNoHistorico.de !== 'eu') return false;
+
+  const horasPassadas = (Date.now() - new Date(lead.ultimaAtividade).getTime()) / 3600000;
+  if (horasPassadas < 4)  return false; // aguarda pelo menos 4h
+  if (horasPassadas > 48) return false; // depois de 48h não faz mais sentido
+
+  return true;
+}
+
+// ── Gera mensagem de follow-up baseada no histórico da negociação ─────────────
+async function gerarFollowUp(veiculo, historico) {
+  const v = veiculo;
+  const ultimas = (historico || []).slice(-10);
+  const conversa = ultimas
+    .map(m => `${m.de === 'eu' ? 'João' : 'Cliente'}: ${m.texto}`)
+    .join('\n');
+
+  const res = await claude.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 50,
+    messages: [{
+      role: 'user',
+      content: `Você é João, vendedor da MotoRide. Veículo: ${v.marca} ${v.modeloMkt || v.modelo} ${v.ano}, R$${Number(v.preco).toLocaleString('pt-BR')}.
+
+O cliente sumiu. Escreva 1 frase curta e natural de follow-up, sem emoji, sem pressão. Mencione o WhatsApp (49) 998351418 se fizer sentido. Português informal.
+
+Conversa:
+${conversa}
+
+Follow-up (1 frase apenas):`
+    }]
+  });
+  return res.content[0].text.trim().replace(/\*\*/g, '').replace(/\*/g, '').replace(/[🏍🚗🚙🏎🤝👍👋🔥💪✅📱]/gu, '').trim();
+}
+
+// ── Lê mensagens recebidas do painel ────────────────────
+async function lerMensagens(page) {
+  return page.evaluate(() => {
+    const painel = document.querySelector('[role="main"]');
+    if (!painel) return [];
+
+    const LIXO = ['Pesquisar','Marketplace','Tudo','Não lidas','Grupos','Conversas',
+      'Enter','Curtir','Responder','Hoje','Ontem','Segunda','Terça','Quarta',
+      'Quinta','Sexta','Sábado','Domingo','Novo Messenger',
+      'Silenciar','Arquivar','Excluir','Denunciar','Bloquear','Ver perfil',
+      'Marcar como não lida','Ativo agora','Ativo recentemente'];
+
+    const msgs = [];
+    for (const el of painel.querySelectorAll('[dir="auto"]')) {
+      const txt = el.textContent?.trim() || '';
+      if (txt.length < 3 || txt.length > 500) continue;
+      if (LIXO.includes(txt)) continue;
+      if (/^\d{1,2}:\d{2}/.test(txt)) continue;
+      if (/\d{1,2} de \w+ de \d{4}/.test(txt)) continue;
+      if (txt.includes('Mensagem enviada') || txt.includes('Você abriu')) continue;
+      if (txt.includes('avaliar um ao outro') || txt.includes('anúncio')) continue;
+      if (txt.includes('Meta Business') || txt.includes('Restaurar')) continue;
+      if (el.closest('[contenteditable]') || el.closest('[role="button"]')) continue;
+
+      let minha = false;
+      let n = el;
+      for (let i = 0; i < 10; i++) {
+        n = n?.parentElement;
+        if (!n || n.tagName === 'BODY') break;
+        const lbl = (n.getAttribute('aria-label') || '').toLowerCase();
+        if (lbl.includes('enviada') || lbl.includes('você')) { minha = true; break; }
+        if (window.getComputedStyle(n).marginLeft === 'auto') { minha = true; break; }
+      }
+      if (!minha) msgs.push(txt);
+    }
+    return [...new Set(msgs)];
+  });
+}
+
+// ── Lê mensagens da conversa (funciona no messenger.com página inteira e popup) ─
+async function lerMensagensPopup(page) {
+  return page.evaluate(() => {
+    const UI = new Set([
+      'Marketplace','Ver comprador','Mais opções','Marcar como pendente',
+      'Mensagem enviada','comprador','Ativo agora','Ativo recentemente',
+      'Você enviou','Bloqueou','Denunciar','Silenciar','Venda',
+      'Ver perfil do comprador','Personalizar conversa','Membros da conversa',
+      'Mídia, arquivos e links','Privacidade e suporte','Pesquisar'
+    ]);
+
+    const clienteMsgs = [];
+    const todasMsgs = [];
+    const seen = new Set();
+
+    // Pega o input para saber onde está a área de digitação (filtro de altura)
+    const input = document.querySelector('[contenteditable="true"][role="textbox"]');
+    const inputTop = input ? input.getBoundingClientRect().top : window.innerHeight;
+
+    for (const el of document.querySelectorAll('[dir="auto"]')) {
+      const rect = el.getBoundingClientRect();
+      // Ignora elementos abaixo da área de digitação ou fora da tela
+      if (rect.top >= inputTop) continue;
+      if (rect.width < 10 || rect.height < 10) continue;
+
+      const txt = el.textContent?.trim() || '';
+      if (txt.length < 2 || txt.length > 600) continue;
+      if (seen.has(txt)) continue;
+      seen.add(txt);
+      if (UI.has(txt)) continue;
+      if (/R\$[\d.,]+\s*[—–]/.test(txt)) continue;        // linha de preço do anúncio
+      if (/^\d{1,2}:\d{2}/.test(txt)) continue;           // hora
+      if (/^\d{1,2} de \w+/.test(txt)) continue;          // data
+      if (/^(segunda|terça|quarta|quinta|sexta|sábado|domingo|hoje|ontem)$/i.test(txt)) continue;
+      if (el.closest('[role="button"]') || el.closest('[contenteditable]')) continue;
+      // Filtra notificações do sistema ("X e outras N pessoas enviaram a você mensagens")
+      if (/enviaram a você|pessoas enviaram|não lida/i.test(txt)) continue;
+      if (/^\s*não lida/i.test(txt)) continue;
+
+      // ── Detecta se é mensagem NOSSA ──────────────────────────────────────────
+      let minha = false;
+      let n = el;
+      for (let i = 0; i < 15; i++) {
+        n = n?.parentElement;
+        if (!n || n.tagName === 'BODY') break;
+        const lbl = (n.getAttribute('aria-label') || '').toLowerCase();
+        // aria-label "Você: texto" ou "enviada" → nossa
+        if (lbl.startsWith('você:') || lbl.includes('enviada') || lbl.includes('você enviou')) {
+          minha = true; break;
+        }
+        const st = window.getComputedStyle(n);
+        if (st.marginLeft === 'auto') { minha = true; break; }
+        if (st.alignSelf === 'flex-end') { minha = true; break; }
+        if (st.justifyContent === 'flex-end') { minha = true; break; }
+      }
+      // Fallback posicional: nossa mensagem fica bem à direita (>70% da tela)
+      // Threshold alto para evitar marcar mensagens template do cliente como nossas
+      if (!minha && rect.left > window.innerWidth * 0.7) minha = true;
+
+      todasMsgs.push({ de: minha ? 'eu' : 'cliente', texto: txt });
+      if (!minha) clienteMsgs.push(txt);
+    }
+
+    // ── Detecta mensagens de voz/áudio do cliente ───────────────────────────────
+    // Elementos de áudio não têm dir="auto", mas têm aria-label ou texto específico
+    const temAudio = Array.from(document.querySelectorAll(
+      'audio, [aria-label*="mensagem de voz"], [aria-label*="voice message"], [aria-label*="Reproduzir"], [aria-label*="Play"]'
+    )).some(el => {
+      const rect = el.getBoundingClientRect();
+      if (rect.top >= inputTop || rect.top <= 0) return false;
+      // Verifica se não é nossa mensagem (fica na direita)
+      return rect.left < window.innerWidth * 0.6;
+    });
+    // Adiciona [áudio] se: sem msgs de texto OU última msg do cliente foi há muito tempo (áudio mais recente)
+    const ultimaClienteTxt = clienteMsgs[clienteMsgs.length - 1];
+    if (temAudio && (!ultimaClienteTxt || ultimaClienteTxt === '[áudio]')) {
+      if (!ultimaClienteTxt) {
+        clienteMsgs.push('[áudio]');
+        todasMsgs.push({ de: 'cliente', texto: '[áudio]' });
+      }
+    } else if (temAudio && clienteMsgs.length > 0) {
+      // Áudio presente junto com texto: pode ser o mais recente — mantém como última msg
+      const ultimaGlobal = todasMsgs[todasMsgs.length - 1];
+      if (!ultimaGlobal || ultimaGlobal.de === 'eu') {
+        clienteMsgs.push('[áudio]');
+        todasMsgs.push({ de: 'cliente', texto: '[áudio]' });
+      }
+    }
+
+    return { clienteMsgs, todasMsgs };
+  });
+}
+
+// ── Envia mensagem (ou simula em DRY_RUN) ────────────────
+async function enviar(page, texto) {
+  if (DRY_RUN) {
+    log.dry(`[simulado] "${texto}"`);
+    return true;
+  }
+
+  const input = await page.$('[contenteditable="true"][role="textbox"]');
+  if (!input) {
+    log.warn('Campo de texto não encontrado');
+    return false;
+  }
+
+  await input.click();
+  await page.waitForTimeout(400);
+  await input.type(texto, { delay: 30 });
+  await page.waitForTimeout(200);
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(1500);
+  return true;
+}
+
+// ── Detecta rows de conversa no inbox ───────────────────
+async function detectarRows(page) {
+  return page.evaluate(() => {
+    const vehicleKws = /honda|chevrolet|fiat|volkswagen|vw|bmw|audi|yamaha|suzuki|kawasaki|titan|biz|\bcg\b|onix|celta|uno|saveiro|strada|s1000/i;
+    const coords = [];
+    const seenY = new Set();
+    for (const el of document.querySelectorAll('div, span, a, li')) {
+      if (el.children.length > 8) continue;
+      const text = (el.textContent || '').trim();
+      if (!text.includes(' · ') || text.length > 250 || text.length < 8) continue;
+      if (/localiza[cç]|no raio|categorias|filtrar|criar novo|pesquisar|explorar|notifica|^escrever para|^Aa$/i.test(text)) continue;
+      if (el.closest('[contenteditable], textarea, input')) continue;
+      const afterDot = text.split(' · ').slice(1).join(' · ');
+      if (!vehicleKws.test(afterDot) && !/\b(19|20)\d{2}\b/.test(afterDot)) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 150 || rect.height < 20 || rect.top < 80) continue;
+      const yKey = Math.round(rect.top / 20) * 20;
+      if (seenY.has(yKey)) continue;
+      seenY.add(yKey);
+      const vehicleHint = afterDot.replace(/\n[\s\S]*/,'').trim().slice(0, 60);
+      const isUnread = /mensagem não lida|está aguardando a sua resposta/i.test(text);
+      coords.push({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, text: text.slice(0, 120), vehicleHint, isUnread });
+    }
+    return coords.slice(0, 15);
+  });
+}
+
+// ── Identifica veículo pelo hint da row ou conteúdo da página ───────────────
+async function identificarVeiculo(page, ativos, vehicleHint) {
+  // 1) Row hint: "2007 Honda Titan 150" — diferencia modelos pelo ano
+  if (vehicleHint) {
+    const hint = vehicleHint.toLowerCase();
+    const v =
+      ativos.find(v => hint.includes((v.modelo||'').toLowerCase()) && hint.includes(String(v.ano))) ||
+      ativos.find(v => hint.includes((v.modelo||'').toLowerCase()) && hint.includes((v.marca||'').toLowerCase())) ||
+      ativos.find(v => (v.modelo||'').length > 2 && hint.includes((v.modelo||'').toLowerCase()));
+    if (v) { log.info(`  Veículo (row hint): ${v.marca} ${v.modelo} ${v.ano}`); return v; }
+
+    // 1b) pastaFotos como alias — ex: "CG 150 EX 2012"
+    const vAlias = ativos.find(v => {
+      const palavras = (v.pastaFotos || '').toLowerCase().split(/\s+/).filter(w => w.length > 2);
+      return palavras.filter(w => hint.includes(w)).length >= 2;
+    });
+    if (vAlias) { log.info(`  Veículo (pastaFotos alias): ${vAlias.marca} ${vAlias.modelo} ${vAlias.ano}`); return vAlias; }
+  }
+
+  // 2) Link do anúncio no DOM
+  const tituloAnuncio = await page.evaluate(() => {
+    const a = document.querySelector('a[href*="/marketplace/item/"]');
+    return a ? (a.getAttribute('aria-label') || a.textContent || '').trim() : '';
+  });
+  if (tituloAnuncio) {
+    const t = tituloAnuncio.toLowerCase();
+    const v = ativos.find(v => t.includes((v.modelo||'').toLowerCase()) && t.includes(String(v.ano)))
+           || ativos.find(v => t.includes((v.modelo||'').toLowerCase()));
+    if (v) { log.info(`  Veículo (link anúncio): ${v.marca} ${v.modelo} ${v.ano}`); return v; }
+  }
+
+  // 3) Texto da página (fallback)
+  const snippet = await page.evaluate(() => (document.body.innerText || '').toLowerCase().slice(0, 2000));
+  const v = ativos.find(v => snippet.includes((v.modelo||'').toLowerCase()) && snippet.includes(String(v.ano)))
+         || ativos.find(v => (v.modelo||'').length > 2 && snippet.includes((v.modelo||'').toLowerCase()));
+  if (v) { log.info(`  Veículo (página): ${v.marca} ${v.modelo} ${v.ano}`); return v; }
+
+  return null;
+}
+
+// ── Fecha qualquer popup do marketplace aberto ───────────
+async function fecharPopups(page) {
+  await page.evaluate(() => {
+    // Clica no X de todos os popups visíveis no lado direito da tela
+    const candidatos = Array.from(document.querySelectorAll('[aria-label]'));
+    for (const el of candidatos) {
+      const lbl = (el.getAttribute('aria-label') || '').toLowerCase();
+      if (!lbl.includes('fechar') && !lbl.includes('close') && !lbl.includes('dismiss')) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0 && rect.left > window.innerWidth * 0.35) {
+        el.click();
+      }
+    }
+    // Fallback: pressiona Escape para fechar qualquer popup/dialog
+  });
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(600);
+}
+
+// ── Processa uma conversa aberta (popup ou página inteira) ───────────────────
+async function processarConversa(page, ativos, convId, vehicleHint, modoClique, respostasNoCiclo, isUnread) {
+  // Verifica se é Marketplace (skip quando modoClique — detectarRows() já garantiu que é marketplace)
+  if (!modoClique) {
+    const ehMkt = await page.evaluate(() => {
+      const txt = document.body.innerText || '';
+      const url = window.location.href;
+      return (
+        url.includes('messenger.com/marketplace') ||
+        url.includes('/marketplace/t/') ||
+        txt.includes('Ver comprador') ||
+        txt.includes('Marcar como pendente') ||
+        !!document.querySelector('a[href*="/marketplace/item/"]') ||
+        /R\$[\d.,]+\s*[—–]/.test(txt)
+      );
+    });
+    if (!ehMkt) {
+      log.info(`[${convId}] Não é Marketplace — ignorando`);
+      return respostasNoCiclo;
+    }
+  }
+
+  // Identifica veículo
+  const veiculo = ativos.length === 1
+    ? ativos[0]
+    : await identificarVeiculo(page, ativos, vehicleHint);
+
+  const foraDeEstoque = !veiculo;
+  if (foraDeEstoque) {
+    log.warn(`[${convId}] Veículo não identificado — respondendo como fora de estoque`);
+  }
+
+  // Lê mensagens
+  let clienteMsgs, todasMsgs;
+  if (modoClique) {
+    const resultado = await lerMensagensPopup(page);
+    clienteMsgs = resultado.clienteMsgs;
+    todasMsgs   = resultado.todasMsgs;
+  } else {
+    clienteMsgs = await lerMensagens(page);
+    todasMsgs   = clienteMsgs.map(t => ({ de: 'cliente', texto: t }));
+  }
+  const ultima = clienteMsgs[clienteMsgs.length - 1] || null;
+  log.info(`  [msgs] ${todasMsgs.length} total | cliente: ${clienteMsgs.length} | "${(ultima||'').slice(0,50)}"`);
+
+  if (!ultima) {
+    log.info(`[${convId}] Nenhuma mensagem do cliente visível`);
+    return respostasNoCiclo;
+  }
+
+  // Se a última mensagem da conversa (toda) é nossa → cliente ainda não respondeu
+  // Exceção: se o sidebar marcou como "mensagem não lida" o cliente respondeu mas não foi detectado
+  const ultimaGeral = todasMsgs[todasMsgs.length - 1];
+  if (ultimaGeral && ultimaGeral.de === 'eu' && !isUnread) {
+    log.info(`[${convId}] Última mensagem é nossa — aguardando cliente`);
+    return respostasNoCiclo;
+  }
+
+  const fpAtual = fingerprint(ultima);
+  const leads   = loadJSON(LEADS_FILE);
+  const lead    = leads[convId] || { historico: [], fpRespondido: '' };
+
+  // Guarda de segurança extra: fpEnviado bate com última msg do cliente → não responder
+  if (fpAtual === (lead.fpEnviado || '__NUNCA__')) {
+    log.info(`[${convId}] Última msg do cliente é nossa resposta anterior — aguardando`);
+    return respostasNoCiclo;
+  }
+
+  // Trava de tempo: se enviamos mensagem há menos de 10min e a última msg do cliente
+  // é a mesma que já respondemos, não envia de novo (cobre falha de detecção visual)
+  if (lead.ultimaEnvio && fpAtual === lead.fpRespondido) {
+    const minutos = (Date.now() - new Date(lead.ultimaEnvio).getTime()) / 60000;
+    if (minutos < 10) {
+      log.info(`[${convId}] Enviado há ${minutos.toFixed(1)}min — aguardando cliente responder`);
+      return respostasNoCiclo;
+    }
+  }
+
+  if (fpAtual === lead.fpRespondido) {
+    if (!foraDeEstoque && deveFollowUp(lead) && respostasNoCiclo < MAX_POR_CICLO) {
+      log.info(`[${convId}] Cliente sumiu — gerando follow-up...`);
+      const followUp = await gerarFollowUp(veiculo, lead.historico);
+      log.info(`  Follow-up: "${followUp}"`);
+      await delayAleatorio();
+      if (await enviar(page, followUp)) {
+        lead.historico = [...(lead.historico||[]), { de: 'eu', texto: followUp }].slice(-20);
+        lead.followUpEnviado = true;
+        lead.ultimaAtividade = new Date().toISOString();
+        leads[convId] = lead;
+        saveJSON(LEADS_FILE, leads);
+        respostasNoCiclo++;
+        log.ok(`[${convId}] Follow-up enviado (${respostasNoCiclo}/${MAX_POR_CICLO})`);
+      }
+    } else {
+      log.info(`[${convId}] Já respondido — nenhuma ação`);
+    }
+  } else {
+    if (respostasNoCiclo >= MAX_POR_CICLO) {
+      log.info(`[${convId}] Limite de envio atingido — verificado, não enviado`);
+      return respostasNoCiclo;
+    }
+    log.info(`[${foraDeEstoque ? 'fora de estoque' : veiculo.marca + ' ' + veiculo.modelo}] Conversa ${convId} | "${ultima.slice(0,60)}"`);
+    const contexto = todasMsgs.slice(0, -1).slice(-10);
+    const resp = foraDeEstoque
+      ? responderForaDeEstoque(vehicleHint, ativos)
+      : await responder(veiculo, contexto, ultima);
+    log.info(`  Resposta: "${resp}"`);
+    await delayAleatorio();
+    if (await enviar(page, resp)) {
+      lead.historico = [...(lead.historico||[]),
+        { de: 'cliente', texto: ultima },
+        { de: 'eu',      texto: resp }
+      ].slice(-20);
+      lead.fpRespondido    = fpAtual;
+      lead.fpEnviado       = fingerprint(resp);
+      lead.followUpEnviado = false;
+      lead.ultimaAtividade = new Date().toISOString();
+      lead.ultimaEnvio     = new Date().toISOString();
+      leads[convId] = lead;
+      saveJSON(LEADS_FILE, leads);
+      respostasNoCiclo++;
+      log.ok(`[${convId}] Enviado (${respostasNoCiclo}/${MAX_POR_CICLO} neste ciclo)`);
+
+      // ── Sincroniza lead no CRM ─────────────────────────────────────────────
+      // Registra desde o primeiro contato; atualiza quando o cliente manda o WhatsApp
+      if (SUPABASE_URL && BOT_SECRET_TOKEN) {
+        const clienteTextosCRM = lead.historico.filter(m => m.de === 'cliente').map(m => m.texto).join(' ');
+        const tel = extrairWhatsApp(clienteTextosCRM); // apenas do cliente, não da loja
+
+        const deveRegistrar = !lead.crmRegistrado;          // primeiro contato
+        const deveAtualizar = tel && !lead.crmTemTelefone;  // cliente mandou o número
+
+        if (deveRegistrar || deveAtualizar) {
+          // Lê o nome do comprador: tenta cabeçalho da conversa antes de usar o título
+          const compradorNome = await page.evaluate(() => {
+            // 1) Cabeçalho da conversa (nome clicável no topo do chat)
+            const header = document.querySelector('h1, [role="main"] a[role="link"] span');
+            if (header) {
+              const txt = (header.textContent || '').trim();
+              if (txt.length > 1 && txt.length < 60 && !/messenger|facebook|marketplace/i.test(txt)) return txt;
+            }
+            // 2) Título da aba sem o sufixo de contagem e domínio
+            const t = document.title || '';
+            const parte = t.split('|')[0].split('·')[0].replace(/^\(\d+\)\s*/, '').trim();
+            if (parte.length > 1 && !/messenger|facebook/i.test(parte)) return parte;
+            return 'Lead Marketplace';
+          }).catch(() => 'Lead Marketplace');
+
+          log.info(`[CRM] ${deveAtualizar ? 'Atualizando' : 'Registrando'} lead: ${compradorNome}${tel ? ' tel:' + tel : ' (sem tel ainda)'}`);
+          sincronizarLeadCRM(convId, compradorNome, veiculo, lead.historico, tel)
+            .then(id => {
+              if (id) {
+                // Relê leads do disco para evitar sobrescrever dados de outras conversas
+                const leadsAtual = loadJSON(LEADS_FILE);
+                const leadAtual  = leadsAtual[convId] || lead;
+                leadAtual.crmRegistrado = true;
+                if (tel) leadAtual.crmTemTelefone = true;
+                leadAtual.crmLeadId = id;
+                leadsAtual[convId] = leadAtual;
+                saveJSON(LEADS_FILE, leadsAtual);
+              }
+            })
+            .catch(e => log.error(`[CRM] ${e.message}`));
+        }
+      }
+
+      await delayAleatorio();
+    }
+  }
+
+  return respostasNoCiclo;
+}
+
+// ── Ciclo principal ──────────────────────────────────────
+async function monitorar(page, context) {
+  const vehicles = loadJSON(VEHICLES_FILE);
+  const ativos   = Object.values(vehicles).filter(v => v.status !== 'vendido');
+  if (ativos.length === 0) { log.warn('Nenhum veículo ativo em data/vehicles.json'); return page; }
+
+  // Abre o inbox do Facebook Messenger (uma navegação por ciclo)
+  await page.goto('https://www.facebook.com/messages/', {
+    waitUntil: 'domcontentloaded', timeout: 20000
+  });
+  await page.waitForTimeout(4000);
+
+  // Detecta bloqueio temporário do Facebook
+  const temBloqueio = await page.evaluate(() =>
+    (document.body?.innerText || '').includes('bloqueado temporariamente')
+  );
+  if (temBloqueio) {
+    log.warn('[FB] Conta bloqueada temporariamente — aguardando 15 minutos...');
+    await new Promise(r => setTimeout(r, 900000));
+    return page;
+  }
+
+  // Detecta página de erro e tenta recarregar em aba nova
+  const temErroFB = await page.evaluate(() =>
+    (document.body?.innerText || '').includes('Ocorreu um erro')
+  );
+  if (temErroFB) {
+    log.warn('[FB] Página de erro — abrindo aba nova...');
+    try { await page.close(); } catch {}
+    page = await context.newPage();
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto('https://www.facebook.com/messages/', {
+      waitUntil: 'domcontentloaded', timeout: 20000
+    });
+    await page.waitForTimeout(5000);
+    const aindaComErro = await page.evaluate(() =>
+      (document.body?.innerText || '').includes('Ocorreu um erro')
+    );
+    if (aindaComErro) {
+      log.warn('[FB] Erro persistente — abortando ciclo');
+      return page;
+    }
+  }
+
+  // Clica na seção Marketplace do sidebar (simula navegação humana)
+  try {
+    const clicou = await page.evaluate(() => {
+      // 1) Tenta pelo href — o mais confiável
+      const byHref = document.querySelector('a[href*="/messages/marketplace"], a[href*="/marketplace/messages"]');
+      if (byHref) { byHref.click(); return 'href'; }
+
+      // 2) Tenta pelo texto — "Marketplace", "Marketplace · 40 min", "Marketplace1 nova mensagem..."
+      //    O textContent inclui os elementos filhos (tempo, notificação), por isso só checa o início
+      for (const el of document.querySelectorAll('a, [role="link"], [role="button"]')) {
+        const txt = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        const lbl = (el.getAttribute('aria-label') || '').trim();
+        const ehMarketplace = /^Marketplace/i.test(txt) || lbl === 'Marketplace';
+        if (!ehMarketplace) continue;
+        const rect = el.getBoundingClientRect();
+        // Deve estar no sidebar esquerdo (não no conteúdo principal)
+        if (rect.width > 30 && rect.width < 400 && rect.height > 20 && rect.top > 50 && rect.left < 350) {
+          el.click(); return 'text';
+        }
+      }
+      return false;
+    });
+    if (clicou) {
+      log.info(`[FB] Clicou no Marketplace do sidebar (via ${clicou})`);
+      await page.waitForTimeout(3000);
+    } else {
+      log.warn('[FB] Ícone Marketplace não encontrado — continuando com conversas visíveis');
+    }
+  } catch (e) {
+    log.warn(`[FB] Erro ao clicar Marketplace: ${e.message}`);
+  }
+
+  await page.screenshot({ path: 'debug.png' });
+
+  const rowsInicial = await detectarRows(page);
+  log.info(`[debug] ${rowsInicial.length} conversa(s) Marketplace detectada(s)`);
+
+  if (rowsInicial.length === 0) {
+    log.warn('Nenhuma conversa encontrada (veja debug.png)');
+    return page;
+  }
+
+  // ── Método clique: sidebar permanece visível, sem navegações extras ──
+  let respostasNoCiclo = 0;
+  const processados = new Set();
+
+  const chaveRow = (r) => {
+    const comprador = r.text.split(' · ')[0].trim().slice(0, 20);
+    const hint = (r.vehicleHint || '').toLowerCase();
+    const veiculo = ativos.find(v =>
+      hint.includes((v.modelo || '').toLowerCase()) && hint.includes(String(v.ano))
+    ) || ativos.find(v =>
+      hint.includes((v.modelo || '').toLowerCase()) && hint.includes((v.marca || '').toLowerCase())
+    ) || ativos.find(v =>
+      (v.modelo || '').length > 2 && hint.includes((v.modelo || '').toLowerCase())
+    );
+    const vStable = veiculo
+      ? `${veiculo.modelo}_${veiculo.ano}`.replace(/\s+/g, '_')
+      : hint.slice(0, 20).replace(/[^a-z0-9]/gi, '_');
+    return (comprador + '_' + vStable).replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '_');
+  };
+
+  while (true) {
+    const rows = await detectarRows(page);
+    const proximo = rows.find(r => !processados.has(chaveRow(r)));
+    if (!proximo) { log.info('Todas as conversas do ciclo processadas'); break; }
+
+    processados.add(chaveRow(proximo));
+
+    try {
+      await fecharPopups(page);
+      log.info(`  Clicando: "${proximo.text.slice(0, 60)}"`);
+      await page.mouse.click(proximo.x, proximo.y);
+      await page.waitForTimeout(3500);
+
+      const urlAtual = page.url();
+      // Captura IDs numéricos (padrão) e alfanuméricos (ex: m_XXXX, e2ee)
+      const mId = urlAtual.match(/\/messages\/t\/([a-zA-Z0-9_-]{5,})/)
+               || urlAtual.match(/\/(?:t|e2ee\/t)\/([a-zA-Z0-9_-]{5,})/)
+               || urlAtual.match(/\/marketplace\/(?:inbox|t)\/([a-zA-Z0-9_-]{5,})/);
+      const convId = mId?.[1] || urlAtual.match(/\d{10,}/)?.[0] || chaveRow(proximo);
+
+      log.info(`  URL: ${urlAtual.slice(-70)}`);
+      respostasNoCiclo = await processarConversa(page, ativos, convId, proximo.vehicleHint, true, respostasNoCiclo, proximo.isUnread);
+
+      // Delay humano entre conversas (sidebar permanece aberto)
+      await page.waitForTimeout(3000 + Math.floor(Math.random() * 3000));
+    } catch (e) {
+      log.error(`[clique] ${e.message}`);
+    }
+  }
+
+  log.info(`Ciclo encerrado — ${respostasNoCiclo} resposta(s) enviada(s)`);
+  return page;
+}
+
+// ── Start ────────────────────────────────────────────────
+async function main() {
+  log.info(`=== MotoRide Bot | ${BOT_NAME} ===`);
+  if (DRY_RUN) log.dry('MODO SIMULAÇÃO ATIVO — nada será enviado');
+
+  const vehicles = loadJSON(VEHICLES_FILE);
+  const ativos   = Object.values(vehicles).filter(v => v.status !== 'vendido');
+  if (ativos.length === 0) {
+    log.error('Cadastre veículos em data/vehicles.json antes de rodar.');
+    process.exit(1);
+  }
+  log.info('Veículos: ' + ativos.map(v => `${v.marca} ${v.modeloMkt || v.modelo} ${v.ano}`).join(', '));
+  log.info(`Config local: MAX_POR_CICLO=${MAX_POR_CICLO} | DELAY=${DELAY_MIN}-${DELAY_MAX}ms | DRY_RUN=${DRY_RUN}`);
+
+  const CHROME_CMD = `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --remote-debugging-port=${CDP_PORT} --user-data-dir="C:\\Users\\User\\chrome-bot-perfil-${CDP_PORT}"`;
+
+  // Loop externo de reconexão — nunca deixa o bot morrer
+  while (true) {
+    let browser, page;
+    try {
+      log.info('Conectando ao Chrome...');
+      browser = await chromium.connectOverCDP(`http://localhost:${CDP_PORT}`);
+      const context = browser.contexts()[0];
+      page = await context.newPage();
+      log.info('Chrome conectado. Monitorando a cada 60s...');
+
+      // Loop interno de monitoramento
+      while (true) {
+        // ── Lê configuração do CRM antes de cada ciclo ──────
+        const config = await lerConfiguracaoCRM();
+        if (config) {
+          if (!config.is_active) {
+            log.info('[CRM] Bot pausado pelo CRM — aguardando reativação...');
+            await enviarHeartbeat(config.id);
+            await new Promise(r => setTimeout(r, 60000));
+            continue;
+          }
+          log.info(`[CRM] Config ativa (id: ${config.id}) | dry_mode: ${config.dry_mode}`);
+          await enviarHeartbeat(config.id);
+        } else {
+          log.info('[CRM] Config não encontrada — usando config local');
+        }
+
+        log.info('--- Verificando inbox ---');
+        try { page = await monitorar(page, context); }
+        catch (e) {
+          log.error(e.message);
+          if (/Target closed|Session closed|Connection closed|browser.*disconnect/i.test(e.message)) {
+            throw e;
+          }
+        }
+        log.info('Aguardando 60s...');
+        await new Promise(r => setTimeout(r, 60000));
+      }
+
+    } catch (e) {
+      log.error(`Conexão perdida: ${e.message}`);
+      try { await browser?.close(); } catch {}
+      log.info('Aguardando 30s para reconectar...');
+      log.info(`Certifique-se que o Chrome está rodando: ${CHROME_CMD}`);
+      await new Promise(r => setTimeout(r, 30000));
+    }
+  }
+}
+
+main().catch(e => { log.error(e.message); process.exit(1); });
