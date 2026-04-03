@@ -14,7 +14,9 @@ const FOTOS_BASE    = 'C:\\Users\\User\\Desktop\\motos para postagem';
 
 // ── CRM (Lovable Edge Functions) ─────────────────────────
 const SUPABASE_URL     = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const BOT_SECRET_TOKEN = process.env.BOT_SECRET_TOKEN;
+const BOT_ID           = process.env.BOT_ID;
 
 async function chamarEdgeFunction(nome, body) {
   if (!SUPABASE_URL || !BOT_SECRET_TOKEN) return null;
@@ -39,6 +41,81 @@ async function chamarEdgeFunction(nome, body) {
     req.on('error', () => resolve(null));
     req.write(data);
     req.end();
+  });
+}
+
+// ── Supabase REST API (leitura/escrita direta em bot_commands) ────────────────
+async function supabaseQuery(path) {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return null;
+  return new Promise((resolve) => {
+    const url = new URL(`${SUPABASE_URL}/rest/v1/${path}`);
+    const options = {
+      hostname: url.hostname,
+      path:     url.pathname + url.search,
+      method:   'GET',
+      headers: {
+        'apikey':        SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+      },
+    };
+    const req = https.request(options, (res) => {
+      let raw = '';
+      res.on('data', chunk => raw += chunk);
+      res.on('end', () => { try { resolve(JSON.parse(raw)); } catch { resolve(null); } });
+    });
+    req.on('error', () => resolve(null));
+    req.end();
+  });
+}
+
+async function supabasePatch(path, body) {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return false;
+  return new Promise((resolve) => {
+    const data = JSON.stringify(body);
+    const url  = new URL(`${SUPABASE_URL}/rest/v1/${path}`);
+    const options = {
+      hostname: url.hostname,
+      path:     url.pathname + url.search,
+      method:   'PATCH',
+      headers: {
+        'apikey':          SUPABASE_ANON_KEY,
+        'Authorization':   `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type':    'application/json',
+        'Content-Length':  Buffer.byteLength(data),
+        'Prefer':          'return=minimal',
+      },
+    };
+    const req = https.request(options, (res) => {
+      let raw = ''; res.on('data', c => raw += c); res.on('end', () => resolve(true));
+    });
+    req.on('error', () => resolve(false));
+    req.write(data);
+    req.end();
+  });
+}
+
+async function buscarProximoComando() {
+  const filtro = BOT_ID
+    ? `bot_commands?bot_id=eq.${BOT_ID}&status=eq.pendente&order=created_at.asc&limit=1`
+    : `bot_commands?status=eq.pendente&order=created_at.asc&limit=1`;
+  const result = await supabaseQuery(filtro);
+  if (!Array.isArray(result) || result.length === 0) return null;
+  return result[0];
+}
+
+async function marcarComandoExecutando(id) {
+  await supabasePatch(`bot_commands?id=eq.${id}`, { status: 'executando' });
+}
+
+async function marcarComandoConcluido(id) {
+  await supabasePatch(`bot_commands?id=eq.${id}`, {
+    status: 'executado', executed_at: new Date().toISOString(),
+  });
+}
+
+async function marcarComandoErro(id, erro) {
+  await supabasePatch(`bot_commands?id=eq.${id}`, {
+    status: 'erro', erro_msg: String(erro), executed_at: new Date().toISOString(),
   });
 }
 
@@ -467,25 +544,22 @@ async function modoDaemon() {
       await enviarHeartbeat(config.id);
     }
 
-    const resultado = await chamarEdgeFunction('bot-get-queue', {});
-    if (!resultado || !resultado.item) {
+    const item = await buscarProximoComando();
+    if (!item) {
       log.info('[FILA] Nenhum item pendente — verificando em 60s...');
       await new Promise(r => setTimeout(r, 60000));
       continue;
     }
 
-    const item = resultado.item;
-    const vehicleId = item.local_bot_id;
+    const vehicleId = item.veiculo_id;
     log.info(`[FILA] Próximo: ${vehicleId} (item: ${item.id})`);
+    await marcarComandoExecutando(item.id);
 
     const vehicles = loadVehicles();
     const v = vehicles[vehicleId];
     if (!v) {
       log.error(`[FILA] Veículo "${vehicleId}" não encontrado em vehicles.json`);
-      await chamarEdgeFunction('bot-update-queue', {
-        item_id: item.id, status: 'error',
-        error_msg: `Veículo ${vehicleId} não encontrado`
-      });
+      await marcarComandoErro(item.id, `Veículo ${vehicleId} não encontrado`);
       continue;
     }
 
@@ -495,12 +569,10 @@ async function modoDaemon() {
 
     try {
       await postarVeiculo(page, v);
-      await chamarEdgeFunction('bot-update-queue', { item_id: item.id, status: 'posted' });
+      await marcarComandoConcluido(item.id);
       log.ok(`[FILA] ${v.marca} ${v.modelo} ${v.ano} — postado e marcado no CRM`);
     } catch (e) {
-      await chamarEdgeFunction('bot-update-queue', {
-        item_id: item.id, status: 'error', error_msg: e.message
-      });
+      await marcarComandoErro(item.id, e.message);
       log.error(`[FILA] Erro ao postar ${vehicleId}: ${e.message}`);
     } finally {
       await page.close();
