@@ -654,7 +654,7 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
           const nomeDoRow = rowText
             ? rowText.split(' · ')[0].replace(/^\(\d+\)\s*/, '').trim()
             : '';
-          const compradorNome = (nomeDoRow.length > 1 && nomeDoRow.length < 60 && !/messenger|facebook|marketplace|conversas/i.test(nomeDoRow))
+          const compradorNome = (nomeDoRow.length > 1 && nomeDoRow.length < 60 && !/messenger|facebook|marketplace|conversas|notifica/i.test(nomeDoRow))
             ? nomeDoRow
             : await page.evaluate(() => {
                 const header = document.querySelector('[role="main"] h1, [data-testid="conversation-title"]');
