@@ -99,6 +99,7 @@ async function sincronizarLeadCRM(convId, compradorNome, veiculo, historico, tel
     seller_name:     'João',
     notes:           notas,
     conv_id:         convId,
+    bot_id:          BOT_ID,
     vehicle_label:   veiculo ? `${veiculo.marca} ${veiculo.modelo} ${veiculo.ano}` : null,
     local_vehicle_id: veiculo?.id || null,  // ex: "v7" — CRM usa pra vincular ao stock_vehicles
   });
@@ -517,7 +518,7 @@ async function fecharPopups(page) {
 }
 
 // ── Processa uma conversa aberta (popup ou página inteira) ───────────────────
-async function processarConversa(page, ativos, convId, vehicleHint, modoClique, respostasNoCiclo, isUnread) {
+async function processarConversa(page, ativos, convId, vehicleHint, modoClique, respostasNoCiclo, isUnread, rowText) {
   // Verifica se é Marketplace (skip quando modoClique — detectarRows() já garantiu que é marketplace)
   if (!modoClique) {
     const ehMkt = await page.evaluate(() => {
@@ -649,20 +650,23 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
         const deveAtualizar = tel && !lead.crmTemTelefone;  // cliente mandou o número
 
         if (deveRegistrar || deveAtualizar) {
-          // Lê o nome do comprador: tenta cabeçalho da conversa antes de usar o título
-          const compradorNome = await page.evaluate(() => {
-            // 1) Cabeçalho da conversa (nome clicável no topo do chat)
-            const header = document.querySelector('h1, [role="main"] a[role="link"] span');
-            if (header) {
-              const txt = (header.textContent || '').trim();
-              if (txt.length > 1 && txt.length < 60 && !/messenger|facebook|marketplace/i.test(txt)) return txt;
-            }
-            // 2) Título da aba sem o sufixo de contagem e domínio
-            const t = document.title || '';
-            const parte = t.split('|')[0].split('·')[0].replace(/^\(\d+\)\s*/, '').trim();
-            if (parte.length > 1 && !/messenger|facebook/i.test(parte)) return parte;
-            return 'Lead Marketplace';
-          }).catch(() => 'Lead Marketplace');
+          // Lê o nome do comprador: extrai da row (formato "Nome · Veículo") ou tenta DOM
+          const nomeDoRow = rowText
+            ? rowText.split(' · ')[0].replace(/^\(\d+\)\s*/, '').trim()
+            : '';
+          const compradorNome = (nomeDoRow.length > 1 && nomeDoRow.length < 60 && !/messenger|facebook|marketplace|conversas/i.test(nomeDoRow))
+            ? nomeDoRow
+            : await page.evaluate(() => {
+                const header = document.querySelector('[role="main"] h1, [data-testid="conversation-title"]');
+                if (header) {
+                  const txt = (header.textContent || '').trim();
+                  if (txt.length > 1 && txt.length < 60 && !/messenger|facebook|marketplace|conversas/i.test(txt)) return txt;
+                }
+                const t = document.title || '';
+                const parte = t.split('|')[0].split('·')[0].replace(/^\(\d+\)\s*/, '').trim();
+                if (parte.length > 1 && !/messenger|facebook|conversas/i.test(parte)) return parte;
+                return 'Lead Marketplace';
+              }).catch(() => 'Lead Marketplace');
 
           log.info(`[CRM] ${deveAtualizar ? 'Atualizando' : 'Registrando'} lead: ${compradorNome}${tel ? ' tel:' + tel : ' (sem tel ainda)'}`);
           sincronizarLeadCRM(convId, compradorNome, veiculo, lead.historico, tel)
@@ -816,7 +820,7 @@ async function monitorar(page, context) {
       const convId = mId?.[1] || urlAtual.match(/\d{10,}/)?.[0] || chaveRow(proximo);
 
       log.info(`  URL: ${urlAtual.slice(-70)}`);
-      respostasNoCiclo = await processarConversa(page, ativos, convId, proximo.vehicleHint, true, respostasNoCiclo, proximo.isUnread);
+      respostasNoCiclo = await processarConversa(page, ativos, convId, proximo.vehicleHint, true, respostasNoCiclo, proximo.isUnread, proximo.text);
 
       // Delay humano entre conversas (sidebar permanece aberto)
       await page.waitForTimeout(3000 + Math.floor(Math.random() * 3000));
