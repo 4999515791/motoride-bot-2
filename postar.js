@@ -10,7 +10,8 @@ require('dotenv').config();
 
 const log           = require('./modules/logger');
 const VEHICLES_FILE = path.join(__dirname, 'data', 'vehicles.json');
-const FOTOS_BASE    = 'C:\\Users\\User\\Desktop\\motos para postagem';
+const FOTOS_BASE    = process.env.FOTOS_DIR || 'C:\\Users\\User\\Desktop\\motos para postagem';
+const TEMP_DIR      = path.join(__dirname, 'temp_fotos');
 
 // ── CRM (Lovable Edge Functions) ─────────────────────────
 const SUPABASE_URL     = process.env.SUPABASE_URL;
@@ -179,21 +180,118 @@ async function carregarVeiculosSupabase() {
   return JSON.parse(fs.readFileSync(VEHICLES_FILE, 'utf8'));
 }
 
-// Retorna fotos com rotação de capa e o próximo índice a salvar
-function getFotosRotacionadas(pastaVeiculo, indiceAtual = 0) {
-  const dir = path.join(FOTOS_BASE, pastaVeiculo);
-  if (!fs.existsSync(dir)) return { fotos: [], proximoIndice: 0 };
+// ── Baixa fotos do Supabase Storage para pasta temp ──────────────────────────
+async function listarFotosStorage(vehicleId) {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return [];
+  return new Promise((resolve) => {
+    const data = JSON.stringify({ prefix: `${vehicleId}/`, limit: 100, offset: 0 });
+    const url  = new URL(`${SUPABASE_URL}/storage/v1/object/list/fotos-veiculos`);
+    const options = {
+      hostname: url.hostname,
+      path:     url.pathname,
+      method:   'POST',
+      headers: {
+        'apikey':          SUPABASE_ANON_KEY,
+        'Authorization':   `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type':    'application/json',
+        'Content-Length':  Buffer.byteLength(data),
+      },
+    };
+    const req = https.request(options, (res) => {
+      let raw = '';
+      res.on('data', c => raw += c);
+      res.on('end', () => {
+        try {
+          const items = JSON.parse(raw);
+          if (!Array.isArray(items)) { resolve([]); return; }
+          const nomes = items
+            .map(i => i.name)
+            .filter(n => n && /\.(jpg|jpeg|png|webp)$/i.test(n))
+            .sort();
+          resolve(nomes);
+        } catch { resolve([]); }
+      });
+    });
+    req.on('error', () => resolve([]));
+    req.write(data);
+    req.end();
+  });
+}
+
+async function baixarFoto(vehicleId, nome, destino) {
+  return new Promise((resolve) => {
+    const url = new URL(`${SUPABASE_URL}/storage/v1/object/public/fotos-veiculos/${vehicleId}/${encodeURIComponent(nome)}`);
+    const options = { hostname: url.hostname, path: url.pathname + url.search, method: 'GET' };
+    const req = https.request(options, (res) => {
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        // redireciona
+        const loc = res.headers.location;
+        https.get(loc, (res2) => {
+          const out = fs.createWriteStream(destino);
+          res2.pipe(out);
+          out.on('finish', () => { out.close(); resolve(true); });
+          out.on('error', () => resolve(false));
+        }).on('error', () => resolve(false));
+        return;
+      }
+      const out = fs.createWriteStream(destino);
+      res.pipe(out);
+      out.on('finish', () => { out.close(); resolve(true); });
+      out.on('error', () => resolve(false));
+    });
+    req.on('error', () => resolve(false));
+    req.end();
+  });
+}
+
+async function getFotosVeiculo(vehicleId, pastaFotosLocal, indiceAtual = 0) {
+  // 1) Tenta Supabase Storage
+  if (SUPABASE_URL && SUPABASE_ANON_KEY) {
+    const nomes = await listarFotosStorage(vehicleId);
+    if (nomes.length > 0) {
+      log.info(`[Storage] ${nomes.length} foto(s) encontrada(s) para ${vehicleId} — baixando...`);
+      if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
+      // limpa temp anterior deste veículo
+      const prefixo = `${vehicleId}_`;
+      for (const f of fs.readdirSync(TEMP_DIR)) {
+        if (f.startsWith(prefixo)) fs.unlinkSync(path.join(TEMP_DIR, f));
+      }
+      const caminhos = [];
+      for (const nome of nomes) {
+        const destino = path.join(TEMP_DIR, `${vehicleId}_${nome}`);
+        const ok = await baixarFoto(vehicleId, nome, destino);
+        if (ok) caminhos.push(destino);
+      }
+      if (caminhos.length > 0) {
+        log.ok(`[Storage] ${caminhos.length} foto(s) baixada(s) para temp`);
+        const indice = indiceAtual % caminhos.length;
+        const rotacionadas = [...caminhos.slice(indice), ...caminhos.slice(0, indice)];
+        return { fotos: rotacionadas.slice(0, 20), proximoIndice: (indice + 1) % caminhos.length, fonte: 'storage' };
+      }
+    }
+  }
+  // 2) Fallback: pasta local
+  log.warn(`[Storage] Sem fotos no Supabase para ${vehicleId} — tentando pasta local`);
+  const dir = path.join(FOTOS_BASE, pastaFotosLocal || '');
+  if (!fs.existsSync(dir)) return { fotos: [], proximoIndice: 0, fonte: 'local' };
   const todas = fs.readdirSync(dir)
     .filter(f => /\.(jpg|jpeg|png|webp)$/i.test(f))
     .sort()
     .map(f => path.join(dir, f));
-  if (todas.length === 0) return { fotos: [], proximoIndice: 0 };
+  if (todas.length === 0) return { fotos: [], proximoIndice: 0, fonte: 'local' };
   const indice = indiceAtual % todas.length;
   const rotacionadas = [...todas.slice(indice), ...todas.slice(0, indice)];
-  return {
-    fotos: rotacionadas.slice(0, 20),
-    proximoIndice: (indice + 1) % todas.length,
-  };
+  return { fotos: rotacionadas.slice(0, 20), proximoIndice: (indice + 1) % todas.length, fonte: 'local' };
+}
+
+function limparTempVeiculo(vehicleId) {
+  if (!fs.existsSync(TEMP_DIR)) return;
+  const prefixo = `${vehicleId}_`;
+  for (const f of fs.readdirSync(TEMP_DIR)) {
+    if (f.startsWith(prefixo)) {
+      try { fs.unlinkSync(path.join(TEMP_DIR, f)); } catch {}
+    }
+  }
 }
 
 const ANGULOS_DESCRICAO = [
@@ -466,12 +564,12 @@ async function selecionarGrupos(page, max = 20) {
 
 // ── LÓGICA DE POSTAGEM (extraída para reutilizar no daemon) ───────────────────
 async function postarVeiculo(page, v) {
-  const { fotos, proximoIndice } = getFotosRotacionadas(v.pastaFotos || '', v.fotoCapaIndex || 0);
+  const { fotos, proximoIndice, fonte } = await getFotosVeiculo(v.id, v.pastaFotos || '', v.fotoCapaIndex || 0);
   if (fotos.length === 0) {
-    throw new Error(`Nenhuma foto em "${path.join(FOTOS_BASE, v.pastaFotos || '')}"`);
+    throw new Error(`Nenhuma foto encontrada para ${v.id} — faça upload no CRM ou na pasta local`);
   }
   const indiceCapa = v.fotoCapaIndex || 0;
-  log.info(`Fotos: ${fotos.length} encontrada(s) — foto de capa: índice ${indiceCapa} (${path.basename(fotos[0])})`);
+  log.info(`Fotos: ${fotos.length} encontrada(s) [${fonte}] — foto de capa: índice ${indiceCapa} (${path.basename(fotos[0])})`);
 
   log.info('Gerando descrição...');
   const descricao = await gerarDescricao(v);
@@ -571,8 +669,10 @@ async function postarVeiculo(page, v) {
         updated_at:      new Date().toISOString(),
       });
       log.ok(`Supabase atualizado — ultimaPostagem registrada, próxima capa: índice ${proximoIndice}`);
+      limparTempVeiculo(v.id);
     } else {
       log.warn('Botão "Publicar" não encontrado. Clique manualmente no Chrome.');
+      limparTempVeiculo(v.id);
     }
   } else {
     log.warn('Botão "Avançar" não encontrado. Verifique pre-publicar.png e clique manualmente.');
