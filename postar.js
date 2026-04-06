@@ -143,6 +143,7 @@ async function carregarVeiculosSupabase() {
       for (const row of rows) {
         const v = {
           id:             row.local_id,
+          uuid:           row.id,          // UUID do Supabase (usado no Storage pelo CRM)
           tipo:           row.tipo || 'moto',
           loja:           row.loja || 'MotoRide',
           marca:          row.marca,
@@ -244,10 +245,17 @@ async function baixarFoto(vehicleId, nome, destino) {
   });
 }
 
-async function getFotosVeiculo(vehicleId, pastaFotosLocal, indiceAtual = 0) {
-  // 1) Tenta Supabase Storage
+async function getFotosVeiculo(vehicleId, pastaFotosLocal, indiceAtual = 0, vehicleUuid = null) {
+  // 1) Tenta Supabase Storage — primeiro pelo local_id, depois pelo UUID (fotos enviadas pelo CRM)
   if (SUPABASE_URL && SUPABASE_ANON_KEY) {
-    const nomes = await listarFotosStorage(vehicleId);
+    let nomes = await listarFotosStorage(vehicleId);
+    let storagePrefix = vehicleId;
+    // CRM salva fotos pelo UUID — tenta se local_id não retornou nada
+    if (nomes.length === 0 && vehicleUuid) {
+      nomes = await listarFotosStorage(vehicleUuid);
+      storagePrefix = vehicleUuid;
+      if (nomes.length > 0) log.info(`[Storage] Fotos encontradas pelo UUID ${vehicleUuid}`);
+    }
     if (nomes.length > 0) {
       log.info(`[Storage] ${nomes.length} foto(s) encontrada(s) para ${vehicleId} — baixando...`);
       if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
@@ -259,7 +267,7 @@ async function getFotosVeiculo(vehicleId, pastaFotosLocal, indiceAtual = 0) {
       const caminhos = [];
       for (const nome of nomes) {
         const destino = path.join(TEMP_DIR, `${vehicleId}_${nome}`);
-        const ok = await baixarFoto(vehicleId, nome, destino);
+        const ok = await baixarFoto(storagePrefix, nome, destino);
         if (ok) caminhos.push(destino);
       }
       if (caminhos.length > 0) {
@@ -564,7 +572,7 @@ async function selecionarGrupos(page, max = 20) {
 
 // ── LÓGICA DE POSTAGEM (extraída para reutilizar no daemon) ───────────────────
 async function postarVeiculo(page, v) {
-  const { fotos, proximoIndice, fonte } = await getFotosVeiculo(v.id, v.pastaFotos || '', v.fotoCapaIndex || 0);
+  const { fotos, proximoIndice, fonte } = await getFotosVeiculo(v.id, v.pastaFotos || '', v.fotoCapaIndex || 0, v.uuid || null);
   if (fotos.length === 0) {
     throw new Error(`Nenhuma foto encontrada para ${v.id} — faça upload no CRM ou na pasta local`);
   }
@@ -588,9 +596,11 @@ async function postarVeiculo(page, v) {
   log.info('Fazendo upload das fotos...');
   const fileInput = await page.$('input[type="file"]');
   if (fileInput) {
-    await fileInput.setInputFiles(fotos);
+    await fileInput.setInputFiles(fotos, { timeout: 90000 });
     log.info(`Aguardando upload de ${fotos.length} foto(s)...`);
-    await page.waitForTimeout(7000);
+    // Espera proporcional ao número de fotos (mínimo 7s, +1s por foto acima de 5)
+    const esperaUpload = 7000 + Math.max(0, fotos.length - 5) * 1000;
+    await page.waitForTimeout(esperaUpload);
     log.ok('Fotos enviadas');
   } else {
     log.warn('Input de arquivo não encontrado');
