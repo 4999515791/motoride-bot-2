@@ -20,8 +20,9 @@ const BOT_NAME     = process.env.BOT_NAME || (BOT_ID === 'facebook2' ? 'Facebook
 const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // ── CRM (Lovable Edge Functions) ─────────────────────────
-const SUPABASE_URL     = process.env.SUPABASE_URL;
-const BOT_SECRET_TOKEN = process.env.BOT_SECRET_TOKEN;
+const SUPABASE_URL      = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const BOT_SECRET_TOKEN  = process.env.BOT_SECRET_TOKEN;
 
 // Chama uma Edge Function do Lovable via HTTPS
 async function chamarEdgeFunction(nome, body) {
@@ -50,6 +51,80 @@ async function chamarEdgeFunction(nome, body) {
     req.write(data);
     req.end();
   });
+}
+
+// ── Supabase REST API — veículos ─────────────────────────
+async function supabaseRestGet(caminho) {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return null;
+  return new Promise((resolve) => {
+    const url = new URL(`${SUPABASE_URL}/rest/v1/${caminho}`);
+    const options = {
+      hostname: url.hostname,
+      path:     url.pathname + url.search,
+      method:   'GET',
+      headers: {
+        'apikey':        SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+      },
+    };
+    const req = https.request(options, (res) => {
+      let raw = '';
+      res.on('data', chunk => raw += chunk);
+      res.on('end', () => { try { resolve(JSON.parse(raw)); } catch { resolve(null); } });
+    });
+    req.on('error', () => resolve(null));
+    req.end();
+  });
+}
+
+function mapearVeiculoSupabase(row) {
+  return {
+    id:             row.local_id,
+    tipo:           row.tipo || 'moto',
+    loja:           row.loja || 'MotoRide',
+    marca:          row.marca,
+    modelo:         row.modelo,
+    modeloMkt:      row.modelo_mkt || row.modelo,
+    versao:         row.versao || '',
+    ano:            String(row.ano),
+    cor:            row.cor,
+    quilometragem:  String(row.quilometragem || 0),
+    preco:          String(row.preco || 0),
+    estadoMecanico: row.estado_mecanico || '',
+    estadoEstetico: row.estado_estetico || '',
+    diferenciais:   row.diferenciais || '',
+    aceitaTroca:    row.aceita_troca !== false,
+    financiamento:  row.financiamento || 'aprovação facilitada, inclusive negativados',
+    observacoes:    row.observacoes || '',
+    carroceria:     row.carroceria || null,
+    corExterna:     row.cor_externa || row.cor || '',
+    corInterna:     row.cor_interna || null,
+    condicao:       row.condicao || 'Excelente',
+    combustivel:    row.combustivel || 'Flex',
+    cambio:         row.cambio || '',
+    pastaFotos:     row.pasta_fotos || '',
+    documento:      row.documento || '100% em dia, transferência imediata',
+    transfere:      row.transfere || 'sim',
+    status:         row.status || 'ativo',
+    ultimaPostagem: row.ultima_postagem || null,
+  };
+}
+
+// Carrega veículos do Supabase (fonte principal) com fallback para JSON local
+async function carregarVeiculosSupabase() {
+  if (SUPABASE_URL && SUPABASE_ANON_KEY) {
+    const rows = await supabaseRestGet('veiculos?status=eq.ativo&order=local_id.asc');
+    if (Array.isArray(rows) && rows.length > 0) {
+      const result = {};
+      for (const row of rows) {
+        const v = mapearVeiculoSupabase(row);
+        result[v.id] = v;
+      }
+      return result;
+    }
+  }
+  log.warn('[Veículos] Supabase indisponível — usando data/vehicles.json local');
+  return loadJSON(VEHICLES_FILE);
 }
 
 // Lê configuração do bot via Edge Function (service_role interno — RLS seguro)
@@ -695,9 +770,9 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
 
 // ── Ciclo principal ──────────────────────────────────────
 async function monitorar(page, context) {
-  const vehicles = loadJSON(VEHICLES_FILE);
+  const vehicles = await carregarVeiculosSupabase();
   const ativos   = Object.values(vehicles).filter(v => v.status !== 'vendido');
-  if (ativos.length === 0) { log.warn('Nenhum veículo ativo em data/vehicles.json'); return page; }
+  if (ativos.length === 0) { log.warn('Nenhum veículo ativo no estoque'); return page; }
 
   // Abre o inbox do Facebook Messenger (uma navegação por ciclo)
   await page.goto('https://www.facebook.com/messages/', {
@@ -838,10 +913,10 @@ async function main() {
   log.info(`=== MotoRide Bot | ${BOT_NAME} ===`);
   if (DRY_RUN) log.dry('MODO SIMULAÇÃO ATIVO — nada será enviado');
 
-  const vehicles = loadJSON(VEHICLES_FILE);
+  const vehicles = await carregarVeiculosSupabase();
   const ativos   = Object.values(vehicles).filter(v => v.status !== 'vendido');
   if (ativos.length === 0) {
-    log.error('Cadastre veículos em data/vehicles.json antes de rodar.');
+    log.error('Nenhum veículo ativo no estoque. Cadastre veículos no CRM.');
     process.exit(1);
   }
   log.info('Veículos: ' + ativos.map(v => `${v.marca} ${v.modeloMkt || v.modelo} ${v.ano}`).join(', '));

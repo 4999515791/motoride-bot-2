@@ -134,7 +134,48 @@ async function enviarHeartbeat(configId) {
 }
 
 // ── Helpers ───────────────────────────────────────────────
-function loadVehicles() {
+async function carregarVeiculosSupabase() {
+  if (SUPABASE_URL && SUPABASE_ANON_KEY) {
+    const rows = await supabaseQuery('veiculos?order=local_id.asc');
+    if (Array.isArray(rows) && rows.length > 0) {
+      const result = {};
+      for (const row of rows) {
+        const v = {
+          id:             row.local_id,
+          tipo:           row.tipo || 'moto',
+          loja:           row.loja || 'MotoRide',
+          marca:          row.marca,
+          modelo:         row.modelo,
+          modeloMkt:      row.modelo_mkt || row.modelo,
+          versao:         row.versao || '',
+          ano:            String(row.ano),
+          cor:            row.cor,
+          quilometragem:  String(row.quilometragem || 0),
+          preco:          String(row.preco || 0),
+          estadoMecanico: row.estado_mecanico || '',
+          estadoEstetico: row.estado_estetico || '',
+          diferenciais:   row.diferenciais || '',
+          aceitaTroca:    row.aceita_troca !== false,
+          financiamento:  row.financiamento || 'aprovação facilitada, inclusive negativados',
+          observacoes:    row.observacoes || '',
+          carroceria:     row.carroceria || null,
+          corExterna:     row.cor_externa || row.cor || '',
+          corInterna:     row.cor_interna || null,
+          condicao:       row.condicao || 'Excelente',
+          combustivel:    row.combustivel || 'Flex',
+          cambio:         row.cambio || '',
+          pastaFotos:     row.pasta_fotos || '',
+          documento:      row.documento || '100% em dia, transferência imediata',
+          transfere:      row.transfere || 'sim',
+          status:         row.status || 'ativo',
+          ultimaPostagem: row.ultima_postagem || null,
+        };
+        result[v.id] = v;
+      }
+      return result;
+    }
+  }
+  log.warn('[Veículos] Supabase indisponível — usando data/vehicles.json local');
   return JSON.parse(fs.readFileSync(VEHICLES_FILE, 'utf8'));
 }
 
@@ -525,13 +566,11 @@ async function postarVeiculo(page, v) {
       await page.screenshot({ path: 'publicado.png' });
       log.ok('=== ANÚNCIO PUBLICADO! Screenshot em publicado.png ===');
 
-      const veiculos = loadVehicles();
-      if (veiculos[v.id]) {
-        veiculos[v.id].ultimaPostagem = new Date().toISOString();
-        veiculos[v.id].fotoCapaIndex = proximoIndice;
-        fs.writeFileSync(VEHICLES_FILE, JSON.stringify(veiculos, null, 2), 'utf8');
-        log.ok(`vehicles.json atualizado — ultimaPostagem registrada, próxima capa: índice ${proximoIndice}`);
-      }
+      await supabasePatch(`veiculos?local_id=eq.${v.id}`, {
+        ultima_postagem: new Date().toISOString(),
+        updated_at:      new Date().toISOString(),
+      });
+      log.ok(`Supabase atualizado — ultimaPostagem registrada, próxima capa: índice ${proximoIndice}`);
     } else {
       log.warn('Botão "Publicar" não encontrado. Clique manualmente no Chrome.');
     }
@@ -578,10 +617,10 @@ async function modoDaemon() {
     log.info(`[FILA] Próximo: ${vehicleId} (item: ${item.id})`);
     await marcarComandoExecutando(item.id);
 
-    const vehicles = loadVehicles();
+    const vehicles = await carregarVeiculosSupabase();
     const v = vehicles[vehicleId];
     if (!v) {
-      log.error(`[FILA] Veículo "${vehicleId}" não encontrado em vehicles.json`);
+      log.error(`[FILA] Veículo "${vehicleId}" não encontrado no estoque`);
       await marcarComandoErro(item.id, `Veículo ${vehicleId} não encontrado`);
       continue;
     }
@@ -609,7 +648,7 @@ async function modoDaemon() {
 async function main() {
   const vehicleId = process.argv[2];
 
-  const vehicles = loadVehicles();
+  const vehicles = await carregarVeiculosSupabase();
   if (!vehicles[vehicleId]) {
     log.error(`Veículo "${vehicleId}" não encontrado.`);
     console.log('\nVeículos disponíveis:');
