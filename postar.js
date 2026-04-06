@@ -94,32 +94,6 @@ async function supabasePatch(path, body) {
   });
 }
 
-async function supabasePost(tablePath, body) {
-  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return false;
-  return new Promise((resolve) => {
-    const data = JSON.stringify(body);
-    const url  = new URL(`${SUPABASE_URL}/rest/v1/${tablePath}`);
-    const options = {
-      hostname: url.hostname,
-      path:     url.pathname + url.search,
-      method:   'POST',
-      headers: {
-        'apikey':          SUPABASE_ANON_KEY,
-        'Authorization':   `Bearer ${SUPABASE_ANON_KEY}`,
-        'Content-Type':    'application/json',
-        'Content-Length':  Buffer.byteLength(data),
-        'Prefer':          'return=minimal',
-      },
-    };
-    const req = https.request(options, (res) => {
-      let raw = ''; res.on('data', c => raw += c); res.on('end', () => resolve(true));
-    });
-    req.on('error', () => resolve(false));
-    req.write(data);
-    req.end();
-  });
-}
-
 async function buscarProximoComando() {
   const filtro = BOT_ID
     ? `bot_commands?bot_id=eq.${BOT_ID}&status=eq.pendente&order=created_at.asc&limit=1`
@@ -566,74 +540,6 @@ async function postarVeiculo(page, v) {
   }
 }
 
-// ── AGENDAMENTOS ─────────────────────────────────────────────────────────────
-async function buscarAgendamentosAtivos() {
-  if (!BOT_ID) return [];
-  const result = await supabaseQuery(
-    `postagem_agendamentos?bot_id=eq.${BOT_ID}&ativo=eq.true`
-  );
-  return Array.isArray(result) ? result : [];
-}
-
-async function inserirComandoAgendado(vehicleId, vehicleLabel) {
-  await supabasePost('bot_commands', {
-    bot_id:        BOT_ID,
-    tipo:          'post',
-    veiculo_id:    vehicleId,
-    veiculo_label: vehicleLabel,
-    status:        'pendente',
-  });
-}
-
-async function atualizarUltimoDisparo(agId) {
-  await supabasePatch(`postagem_agendamentos?id=eq.${agId}`, {
-    ultimo_disparo: new Date().toISOString(),
-    updated_at:     new Date().toISOString(),
-  });
-}
-
-async function verificarAgendamentos() {
-  const agendamentos = await buscarAgendamentosAtivos();
-  if (agendamentos.length === 0) return;
-
-  const agora     = new Date();
-  const diaSemana = agora.getDay(); // 0=Dom, 1=Seg ... 6=Sab
-  const horaAtual = `${String(agora.getHours()).padStart(2, '0')}:${String(agora.getMinutes()).padStart(2, '0')}`;
-
-  for (const ag of agendamentos) {
-    // Verifica dia da semana
-    if (!ag.dias_semana.includes(diaSemana)) continue;
-
-    // Verifica horário (compara HH:MM)
-    const horaAg = String(ag.horario).slice(0, 5);
-    if (horaAtual !== horaAg) continue;
-
-    // Evita disparar duas vezes no mesmo horário (janela de 23h)
-    if (ag.ultimo_disparo) {
-      const diff = agora - new Date(ag.ultimo_disparo);
-      if (diff < 23 * 60 * 60 * 1000) continue;
-    }
-
-    log.info(`[AGENDA] Disparando agendamento ${ag.id} — tipo: ${ag.tipo} — horário: ${horaAg}`);
-
-    if (ag.tipo === 'todos_veiculos') {
-      const vehicles = loadVehicles();
-      let count = 0;
-      for (const v of Object.values(vehicles)) {
-        if (v.status !== 'ativo') continue;
-        await inserirComandoAgendado(v.id, `${v.marca} ${v.modelo} ${v.ano}`);
-        count++;
-      }
-      log.ok(`[AGENDA] ${count} veículo(s) inserido(s) na fila`);
-    } else if (ag.tipo === 'veiculo_unico' && ag.veiculo_id) {
-      await inserirComandoAgendado(ag.veiculo_id, ag.veiculo_label || ag.veiculo_id);
-      log.ok(`[AGENDA] Veículo ${ag.veiculo_id} inserido na fila`);
-    }
-
-    await atualizarUltimoDisparo(ag.id);
-  }
-}
-
 // ── MODO DAEMON — puxa fila do CRM automaticamente ───────────────────────────
 async function modoDaemon() {
   log.info('=== MotoRide Bot Posting — Modo Daemon ===');
@@ -660,8 +566,6 @@ async function modoDaemon() {
       }
       await enviarHeartbeat(config.id);
     }
-
-    await verificarAgendamentos();
 
     const item = await buscarProximoComando();
     if (!item) {
