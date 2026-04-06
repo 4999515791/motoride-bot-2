@@ -138,16 +138,35 @@ function loadVehicles() {
   return JSON.parse(fs.readFileSync(VEHICLES_FILE, 'utf8'));
 }
 
-function getFotos(pastaVeiculo) {
+// Retorna fotos com rotação de capa e o próximo índice a salvar
+function getFotosRotacionadas(pastaVeiculo, indiceAtual = 0) {
   const dir = path.join(FOTOS_BASE, pastaVeiculo);
-  if (!fs.existsSync(dir)) return [];
-  return fs.readdirSync(dir)
+  if (!fs.existsSync(dir)) return { fotos: [], proximoIndice: 0 };
+  const todas = fs.readdirSync(dir)
     .filter(f => /\.(jpg|jpeg|png|webp)$/i.test(f))
-    .map(f => path.join(dir, f))
-    .slice(0, 20);
+    .sort()
+    .map(f => path.join(dir, f));
+  if (todas.length === 0) return { fotos: [], proximoIndice: 0 };
+  const indice = indiceAtual % todas.length;
+  const rotacionadas = [...todas.slice(indice), ...todas.slice(0, indice)];
+  return {
+    fotos: rotacionadas.slice(0, 20),
+    proximoIndice: (indice + 1) % todas.length,
+  };
 }
 
+const ANGULOS_DESCRICAO = [
+  'Destaque o excelente custo-benefício e quanto o comprador vai economizar comparado à concorrência.',
+  'Enfatize o estado impecável de conservação e a tranquilidade de comprar um veículo sem dor de cabeça.',
+  'Use tom animado e urgente, transmitindo que é uma oportunidade imperdível que vai sair rápido.',
+  'Foque na facilidade do financiamento e que qualquer pessoa pode sair com o veículo hoje.',
+  'Destaque os diferenciais únicos deste veículo e o que o faz se destacar de outros anúncios.',
+  'Escreva como se estivesse conversando diretamente com o comprador, de forma próxima e descontraída.',
+  'Ressalte o histórico de manutenção e confiabilidade para quem quer segurança na compra.',
+];
+
 async function gerarDescricao(v) {
+  const angulo = ANGULOS_DESCRICAO[Math.floor(Math.random() * ANGULOS_DESCRICAO.length)];
   const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const res = await claude.messages.create({
     model: 'claude-haiku-4-5-20251001',
@@ -156,6 +175,7 @@ async function gerarDescricao(v) {
       role: 'user',
       content: `Crie uma descrição de anúncio para Facebook Marketplace para este veículo.
 REGRAS OBRIGATÓRIAS: texto corrido, SEM asteriscos, SEM markdown, SEM bullet points, máximo 5 linhas, linguagem informal brasileira, estilo vendedor de loja.
+ÂNGULO DESTA DESCRIÇÃO (siga obrigatoriamente): ${angulo}
 Termine SEMPRE com: "Financiamento facilitado, inclusive negativados. Chame no privado!"
 
 Dados do veículo:
@@ -166,6 +186,7 @@ Troca: ${v.aceitaTroca ? 'aceita' : 'não aceita'} | Financiamento: ${v.financia
 ${v.observacoes ? 'Obs: ' + v.observacoes : ''}`
     }]
   });
+  log.info(`  [ângulo] ${angulo}`);
   return res.content[0].text.trim().replace(/\*\*/g, '').replace(/\*/g, '');
 }
 
@@ -404,11 +425,12 @@ async function selecionarGrupos(page, max = 20) {
 
 // ── LÓGICA DE POSTAGEM (extraída para reutilizar no daemon) ───────────────────
 async function postarVeiculo(page, v) {
-  const fotos = getFotos(v.pastaFotos || '');
+  const { fotos, proximoIndice } = getFotosRotacionadas(v.pastaFotos || '', v.fotoCapaIndex || 0);
   if (fotos.length === 0) {
     throw new Error(`Nenhuma foto em "${path.join(FOTOS_BASE, v.pastaFotos || '')}"`);
   }
-  log.info(`Fotos: ${fotos.length} encontrada(s)`);
+  const indiceCapa = v.fotoCapaIndex || 0;
+  log.info(`Fotos: ${fotos.length} encontrada(s) — foto de capa: índice ${indiceCapa} (${path.basename(fotos[0])})`);
 
   log.info('Gerando descrição...');
   const descricao = await gerarDescricao(v);
@@ -506,8 +528,9 @@ async function postarVeiculo(page, v) {
       const veiculos = loadVehicles();
       if (veiculos[v.id]) {
         veiculos[v.id].ultimaPostagem = new Date().toISOString();
+        veiculos[v.id].fotoCapaIndex = proximoIndice;
         fs.writeFileSync(VEHICLES_FILE, JSON.stringify(veiculos, null, 2), 'utf8');
-        log.ok('vehicles.json atualizado — ultimaPostagem registrada');
+        log.ok(`vehicles.json atualizado — ultimaPostagem registrada, próxima capa: índice ${proximoIndice}`);
       }
     } else {
       log.warn('Botão "Publicar" não encontrado. Clique manualmente no Chrome.');
@@ -523,9 +546,9 @@ async function modoDaemon() {
 
   let browser;
   try {
-    browser = await chromium.connectOverCDP('http://localhost:9222');
+    browser = await chromium.connectOverCDP(`http://localhost:${process.env.CDP_PORT || 9222}`);
   } catch {
-    log.error('Chrome não encontrado na porta 9222.');
+    log.error(`Chrome não encontrado na porta ${process.env.CDP_PORT || 9222}.`);
     process.exit(1);
   }
 
