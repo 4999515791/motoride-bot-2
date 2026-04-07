@@ -24,6 +24,10 @@ const SUPABASE_URL      = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const BOT_SECRET_TOKEN  = process.env.BOT_SECRET_TOKEN;
 
+// ── Telegram ──────────────────────────────────────────────
+const TELEGRAM_TOKEN   = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
 // Chama uma Edge Function do Lovable via HTTPS
 async function chamarEdgeFunction(nome, body) {
   if (!SUPABASE_URL || !BOT_SECRET_TOKEN) return null;
@@ -51,6 +55,21 @@ async function chamarEdgeFunction(nome, body) {
     req.write(data);
     req.end();
   });
+}
+
+// ── Telegram — notificações ──────────────────────────────
+function notificarTelegram(mensagem) {
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return;
+  const data = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: mensagem, parse_mode: 'HTML' });
+  const req = https.request({
+    hostname: 'api.telegram.org',
+    path: `/bot${TELEGRAM_TOKEN}/sendMessage`,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+  }, (res) => { res.resume(); });
+  req.on('error', (e) => log.warn(`[Telegram] Falha ao notificar: ${e.message}`));
+  req.write(data);
+  req.end();
 }
 
 // ── Supabase REST API — veículos ─────────────────────────
@@ -753,6 +772,21 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
               }).catch(() => 'Lead Marketplace');
 
           log.info(`[CRM] ${deveAtualizar ? 'Atualizando' : 'Registrando'} lead: ${compradorNome}${tel ? ' tel:' + tel : ' (sem tel ainda)'}`);
+
+          // Notifica Telegram: novo lead OU lead acabou de mandar WhatsApp
+          const isNovoLead     = !deveAtualizar;
+          const chegouTelefone = deveAtualizar && tel && !lead.crmTemTelefone;
+          if (isNovoLead || chegouTelefone) {
+            const botNomes = { facebook1: 'Jhow', facebook2: 'João Moto Ride', facebook3: 'Lucas Moto Ride' };
+            const botNome  = botNomes[BOT_ID] || BOT_ID;
+            const veiculoLabel = veiculo ? `${veiculo.marca} ${veiculo.modelo} ${veiculo.ano}` : 'veículo desconhecido';
+            const linhasTel = tel ? `📞 <b>WhatsApp:</b> ${tel}` : `📭 Ainda sem telefone`;
+            const titulo = isNovoLead ? '🆕 Novo lead no Marketplace!' : '📱 Lead mandou WhatsApp!';
+            notificarTelegram(
+              `${titulo}\n👤 <b>${compradorNome}</b>\n🚗 ${veiculoLabel}\n${linhasTel}\n🤖 Bot: ${botNome}`
+            );
+          }
+
           sincronizarLeadCRM(convId, compradorNome, veiculo, lead.historico, tel)
             .then(id => {
               if (id) {
