@@ -541,7 +541,7 @@ async function enviar(page, texto) {
 // ── Detecta rows de conversa no inbox ───────────────────
 async function detectarRows(page) {
   return page.evaluate(() => {
-    const vehicleKws = /honda|chevrolet|fiat|volkswagen|vw|bmw|audi|yamaha|suzuki|kawasaki|titan|biz|\bcg\b|onix|celta|uno|saveiro|strada|s1000/i;
+    const vehicleKws = /honda|chevrolet|fiat|volkswagen|vw|bmw|audi|yamaha|suzuki|kawasaki|titan|biz|\bcg\b|bros|xre|nxr|pop 110|factor|fazer|tenere|onix|celta|uno|saveiro|strada|s1000|jetta|sandero|corsa|gol|palio|siena|fiesta|ka\b|civic|fit|hr-v|city/i;
     const coords = [];
     const seenY = new Set();
     for (const el of document.querySelectorAll('div, span, a, li')) {
@@ -558,9 +558,13 @@ async function detectarRows(page) {
       if (seenY.has(yKey)) continue;
       seenY.add(yKey);
       const vehicleHint = afterDot
-        .replace(/\n[\s\S]*/, '')          // preview separado por \n
-        .replace(/\s*Você:[\s\S]*/i, '')   // "Você: mensagem enviada"
-        .replace(/\s*[A-ZÁÉÍÓÚ][a-záéíóú]+:[\s\S]*/,'') // "Nome: mensagem recebida"
+        .replace(/\n[\s\S]*/, '')                             // preview separado por \n
+        .replace(/\s*Você:[\s\S]*/i, '')                      // "Você: mensagem enviada"
+        .replace(/\s*[A-ZÁÉÍÓÚ][a-záéíóú]+:[\s\S]*/,'')      // "Nome: mensagem recebida"
+        .replace(/\s*Mensagem\s+não\s+lida[\s\S]*/i, '')      // "Mensagem não lida"
+        .replace(/\s*Agora\s+voc[êe]s[\s\S]*/i, '')          // "Agora vocês podem avaliar..."
+        .replace(/\s*está\s+aguardando[\s\S]*/i, '')          // "está aguardando a sua resposta"
+        .replace(/\s*·\s*\d+\s*$/, '')                        // " · 0" badge de notificação
         .trim()
         .slice(0, 60);
       const isUnread = /mensagem não lida|está aguardando a sua resposta/i.test(text);
@@ -601,17 +605,20 @@ async function identificarVeiculo(page, ativos, vehicleHint) {
     if (v) { log.info(`  Veículo (link anúncio): ${v.marca} ${v.modelo} ${v.ano}`); return v; }
   }
 
-  // 3) Texto da página (fallback) — só usa se não havia vehicleHint específico
-  // Se havia hint mas não bateu, é veículo fora do estoque: não tenta adivinhar
+  // 3) Texto da página (fallback) — sempre tenta, mesmo se havia hint mas não bateu
+  // Hint contaminado (ex: "Honda CG 125Mensagem não lida") não deve bloquear este fallback
   if (vehicleHint && vehicleHint.trim().length > 3) {
-    log.warn(`  Veículo não encontrado no estoque para hint: "${vehicleHint}"`);
-    return null;
+    log.warn(`  Hint "${vehicleHint}" não bateu no estoque — tentando fallback DOM/página`);
   }
   const snippet = await page.evaluate(() => (document.body.innerText || '').toLowerCase().slice(0, 2000));
   const v = ativos.find(v => snippet.includes((v.modelo||'').toLowerCase()) && snippet.includes(String(v.ano)))
          || ativos.find(v => (v.modelo||'').length > 2 && snippet.includes((v.modelo||'').toLowerCase()));
   if (v) { log.info(`  Veículo (página): ${v.marca} ${v.modelo} ${v.ano}`); return v; }
 
+  // Só declara fora de estoque depois de esgotar todas as fontes
+  if (vehicleHint && vehicleHint.trim().length > 3) {
+    log.warn(`  Veículo definitivamente não encontrado para hint: "${vehicleHint}"`);
+  }
   return null;
 }
 
