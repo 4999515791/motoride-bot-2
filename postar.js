@@ -171,6 +171,7 @@ async function carregarVeiculosSupabase() {
           transfere:      row.transfere || 'sim',
           status:         row.status || 'ativo',
           ultimaPostagem: row.ultima_postagem || null,
+          fotoCapaIndex:  row.foto_capa_index || 0,
         };
         result[v.id] = v;
       }
@@ -676,6 +677,7 @@ async function postarVeiculo(page, v) {
 
       await supabasePatch(`veiculos?local_id=eq.${v.id}`, {
         ultima_postagem: new Date().toISOString(),
+        foto_capa_index: proximoIndice,
         updated_at:      new Date().toISOString(),
       });
       log.ok(`Supabase atualizado — ultimaPostagem registrada, próxima capa: índice ${proximoIndice}`);
