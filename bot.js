@@ -557,7 +557,12 @@ async function detectarRows(page) {
       const yKey = Math.round(rect.top / 20) * 20;
       if (seenY.has(yKey)) continue;
       seenY.add(yKey);
-      const vehicleHint = afterDot.replace(/\n[\s\S]*/,'').trim().slice(0, 60);
+      const vehicleHint = afterDot
+        .replace(/\n[\s\S]*/, '')          // preview separado por \n
+        .replace(/\s*Você:[\s\S]*/i, '')   // "Você: mensagem enviada"
+        .replace(/\s*[A-ZÁÉÍÓÚ][a-záéíóú]+:[\s\S]*/,'') // "Nome: mensagem recebida"
+        .trim()
+        .slice(0, 60);
       const isUnread = /mensagem não lida|está aguardando a sua resposta/i.test(text);
       coords.push({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, text: text.slice(0, 120), vehicleHint, isUnread });
     }
