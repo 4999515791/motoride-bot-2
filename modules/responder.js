@@ -34,7 +34,8 @@ REGRAS:
 - WhatsApp para fechar: (49) 99951-5791
 - Sem bullet points, texto corrido
 - Linguagem brasileira informal
-- Financiamento: aprovação facilitada, inclusive negativados`;
+- Financiamento: aprovação facilitada, inclusive negativados
+- PROIBIDO mencionar valores de parcela, prestação ou simulação — não temos tabela de financiamento. Diga só que a aprovação é facilitada e que os detalhes são no WhatsApp`;
 }
 
 async function gerar(vehicle, historico, mensagem) {

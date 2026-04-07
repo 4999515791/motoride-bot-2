@@ -153,6 +153,8 @@ function extrairWhatsApp(texto) {
   if (!match) return null;
   const digits = match[0].replace(/\D/g, '');
   if (digits.length < 8 || digits.length > 13) return null;
+  // Ignora os números da própria loja para não salvar como WhatsApp do cliente
+  if (digits.includes('998351418') || digits.includes('999515791')) return null;
   return digits;
 }
 
@@ -245,9 +247,9 @@ async function responderFallback(veiculo, historico, mensagem) {
   } else if (!temWppCliente) {
     instrucao = `Já sabe a forma de compra. ${
       /financ/i.test(todasTextos)
-        ? 'Diga que trabalha com aprovação facilitada inclusive para negativados. '
+        ? 'Diga apenas que a aprovação é facilitada inclusive para negativados, SEM mencionar nenhum valor de parcela ou prestação — os detalhes são passados no WhatsApp. '
         : ''
-    }OBRIGATÓRIO: inclua o número da loja na resposta: (49) 998351418. TAMBÉM peça o WhatsApp do cliente para poder chamá-lo: "me manda seu WhatsApp também". Máximo 2 frases.`;
+    }Passe o número da loja E peça o WhatsApp do cliente em frases separadas. Exemplo: "Nosso WhatsApp é (49) 998351418. Qual o seu para eu te chamar lá?" NUNCA mencione parcelas ou valores de financiamento. Máximo 2 frases.`;
   } else {
     instrucao = `Cliente já mandou o WhatsApp dele (${telCliente}). Confirme que vai chamar por lá e encerre a conversa do Marketplace de forma simpática. 1 frase.`;
   }
@@ -275,6 +277,8 @@ REGRAS:
 - Não inventar informações do veículo
 - Nunca usar emojis, asteriscos ou markdown
 - Sempre conduzir para o próximo passo
+- PROIBIDO mencionar valor de parcela, prestação ou simulação de financiamento — você não tem tabela de financiamento. Diga apenas que trabalha com aprovação facilitada e que os detalhes são passados no WhatsApp
+- PROIBIDO inventar cálculos como "R$ 2.700 por mês" ou qualquer valor de parcela
 
 INSTRUÇÃO PARA ESTA MENSAGEM: ${instrucao}`;
 
@@ -564,7 +568,12 @@ async function identificarVeiculo(page, ativos, vehicleHint) {
     if (v) { log.info(`  Veículo (link anúncio): ${v.marca} ${v.modelo} ${v.ano}`); return v; }
   }
 
-  // 3) Texto da página (fallback)
+  // 3) Texto da página (fallback) — só usa se não havia vehicleHint específico
+  // Se havia hint mas não bateu, é veículo fora do estoque: não tenta adivinhar
+  if (vehicleHint && vehicleHint.trim().length > 3) {
+    log.warn(`  Veículo não encontrado no estoque para hint: "${vehicleHint}"`);
+    return null;
+  }
   const snippet = await page.evaluate(() => (document.body.innerText || '').toLowerCase().slice(0, 2000));
   const v = ativos.find(v => snippet.includes((v.modelo||'').toLowerCase()) && snippet.includes(String(v.ano)))
          || ativos.find(v => (v.modelo||'').length > 2 && snippet.includes((v.modelo||'').toLowerCase()));
