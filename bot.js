@@ -30,7 +30,10 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 // Chama uma Edge Function do Lovable via HTTPS
 async function chamarEdgeFunction(nome, body) {
-  if (!SUPABASE_URL || !BOT_SECRET_TOKEN) return null;
+  if (!SUPABASE_URL || !BOT_SECRET_TOKEN) {
+    log.warn(`[EdgeFn] ${nome} — SUPABASE_URL ou BOT_SECRET_TOKEN não definidos`);
+    return null;
+  }
   return new Promise((resolve) => {
     const data = JSON.stringify(body);
     const url  = new URL(`${SUPABASE_URL}/functions/v1/${nome}`);
@@ -48,10 +51,16 @@ async function chamarEdgeFunction(nome, body) {
       let raw = '';
       res.on('data', chunk => raw += chunk);
       res.on('end', () => {
+        if (res.statusCode >= 400) {
+          log.warn(`[EdgeFn] ${nome} — HTTP ${res.statusCode} | body: ${raw.slice(0, 300)}`);
+        }
         try { resolve(JSON.parse(raw)); } catch { resolve(null); }
       });
     });
-    req.on('error', () => resolve(null));
+    req.on('error', (e) => {
+      log.warn(`[EdgeFn] ${nome} — erro de rede: ${e.message}`);
+      resolve(null);
+    });
     req.write(data);
     req.end();
   });
@@ -751,6 +760,8 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
 
         const deveRegistrar = !lead.crmRegistrado;          // primeiro contato
         const deveAtualizar = tel && !lead.crmTemTelefone;  // cliente mandou o número
+
+        log.info(`[CRM] deveRegistrar=${deveRegistrar} deveAtualizar=${!!deveAtualizar} crmRegistrado=${!!lead.crmRegistrado} tel=${tel||'—'}`);
 
         if (deveRegistrar || deveAtualizar) {
           // Lê o nome do comprador: extrai da row (formato "Nome · Veículo") ou tenta DOM
