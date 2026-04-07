@@ -476,7 +476,13 @@ async function clicarBotao(page, texto) {
   for (const sel of seletores) {
     const btn = await page.$(sel);
     if (btn) {
-      await btn.click();
+      try {
+        // Tenta click normal primeiro
+        await btn.click({ timeout: 5000 });
+      } catch {
+        // Overlay interceptando — usa click direto no DOM
+        await btn.evaluate(el => el.click());
+      }
       await page.waitForTimeout(2500);
       return true;
     }
