@@ -284,7 +284,7 @@ async function responderFallback(veiculo, historico, mensagem) {
     return `Tudo bem, sem problema! Se mudar de ideia ou quiser ver outro veículo, é só chamar. Bom dia!`;
   }
 
-  const LINK_WPP     = 'https://wa.me/5549998351418';
+  const LINK_WPP     = 'https://api.whatsapp.com/send?phone=5549998351418';
   const LINK_VITRINE = 'https://crmmotoride.lovable.app/vitrine';
   const LINK_VEICULO = `https://crmmotoride.lovable.app/vitrine/${v.id}`;
 
@@ -367,7 +367,7 @@ INSTRUÇÃO PARA ESTA MENSAGEM: ${instrucao}`;
   resposta = resposta.replace(/49\s*998351418/g, LINK_WPP);
 
   // Garante que link está na resposta quando estágio é pedir WhatsApp
-  if (!temWppCliente && temForma && !/wa\.me/.test(resposta)) {
+  if (!temWppCliente && temForma && !/api\.whatsapp\.com/.test(resposta)) {
     resposta += ` ${LINK_WPP}`;
   }
 
@@ -380,7 +380,7 @@ async function responder(veiculo, historico, mensagem) {
 
 function responderForaDeEstoque(vehicleHint) {
   const mencionado = vehicleHint ? vehicleHint.trim() : 'esse veículo';
-  return `Infelizmente o ${mencionado} não está mais disponível. Temos outros veículos, dá uma olhada: https://crmmotoride.lovable.app/vitrine — me passa seu WhatsApp que te ajudo a escolher: https://wa.me/5549998351418`;
+  return `Infelizmente o ${mencionado} não está mais disponível. Temos outros veículos, dá uma olhada: https://crmmotoride.lovable.app/vitrine — me passa seu WhatsApp que te ajudo a escolher: https://api.whatsapp.com/send?phone=5549998351418`;
 }
 
 // ── Verifica se deve enviar follow-up (cliente sumiu após nossa resposta) ──────
@@ -791,7 +791,7 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
     if (foraDeEstoque) {
       const telNaMsg = extrairWhatsApp(ultima);
       resp = telNaMsg
-        ? `Obrigado pelo contato! Vou te chamar no ${telNaMsg} pelo WhatsApp pra ver o que temos disponível que pode te atender. https://wa.me/5549998351418`
+        ? `Obrigado pelo contato! Vou te chamar no ${telNaMsg} pelo WhatsApp pra ver o que temos disponível que pode te atender. https://api.whatsapp.com/send?phone=5549998351418`
         : responderForaDeEstoque(vehicleHint);
     } else {
       resp = await responder(veiculo, contexto, ultima);
