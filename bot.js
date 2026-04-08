@@ -210,7 +210,7 @@ async function sincronizarLeadCRM(convId, compradorNome, veiculo, historico, tel
     phone:           telefone,
     interest:        interesse,
     source:          'marketplace-facebook',
-    seller_name:     'João',
+    seller_name:     { facebook1: 'Jhow', facebook2: 'João', facebook3: 'Lucas' }[BOT_ID] || BOT_ID,
     notes:           notas,
     conv_id:         convId,
     bot_id:          BOT_ID,
@@ -503,6 +503,7 @@ async function lerMensagensPopup(page) {
       // Filtra notificações do sistema ("X e outras N pessoas enviaram a você mensagens")
       if (/enviaram a você|pessoas enviaram|não lida/i.test(txt)) continue;
       if (/^\s*não lida/i.test(txt)) continue;
+      if (/nova notifica[cç][aã]o/i.test(txt)) continue;
 
       // ── Detecta se é mensagem NOSSA ──────────────────────────────────────────
       let minha = false;
@@ -603,7 +604,7 @@ async function detectarRows(page) {
         .replace(/\n[\s\S]*/, '')                             // preview separado por \n
         .replace(/\s*Você:[\s\S]*/i, '')                      // "Você: mensagem enviada"
         .replace(/\s*[A-ZÁÉÍÓÚ][a-záéíóú]+:[\s\S]*/,'')      // "Nome: mensagem recebida"
-        .replace(/\s*Mensagem\s+não\s+lida[\s\S]*/i, '')      // "Mensagem não lida"
+        .replace(/Mensagem\s+n.o\s+lida[\s\S]*/i, '')            // "Mensagem não lida" (qualquer encoding do ã, sem exigir espaço antes)
         .replace(/\s*Agora\s+voc[êe]s[\s\S]*/i, '')          // "Agora vocês podem avaliar..."
         .replace(/\s*está\s+aguardando[\s\S]*/i, '')          // "está aguardando a sua resposta"
         .replace(/\s*·\s*\d+\s*$/, '')                        // " · 0" badge de notificação
@@ -786,9 +787,15 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
     }
     log.info(`[${foraDeEstoque ? 'fora de estoque' : veiculo.marca + ' ' + veiculo.modelo}] Conversa ${convId} | "${ultima.slice(0,60)}"`);
     const contexto = todasMsgs.slice(0, -1).slice(-10);
-    const resp = foraDeEstoque
-      ? responderForaDeEstoque(vehicleHint, ativos)
-      : await responder(veiculo, contexto, ultima);
+    let resp;
+    if (foraDeEstoque) {
+      const telNaMsg = extrairWhatsApp(ultima);
+      resp = telNaMsg
+        ? `Obrigado pelo contato! Vou te chamar no ${telNaMsg} pelo WhatsApp pra ver o que temos disponível que pode te atender. https://wa.me/5549998351418`
+        : responderForaDeEstoque(vehicleHint);
+    } else {
+      resp = await responder(veiculo, contexto, ultima);
+    }
     log.info(`  Resposta: "${resp}"`);
     await delayAleatorio();
     if (await enviar(page, resp)) {
