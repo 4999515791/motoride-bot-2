@@ -284,8 +284,9 @@ async function responderFallback(veiculo, historico, mensagem) {
     return `Tudo bem, sem problema! Se mudar de ideia ou quiser ver outro veículo, é só chamar. Bom dia!`;
   }
 
-  const LINK_WPP    = 'https://wa.me/5549998351418';
+  const LINK_WPP     = 'https://wa.me/5549998351418';
   const LINK_VITRINE = 'https://crmmotoride.lovable.app/vitrine';
+  const LINK_VEICULO = `https://crmmotoride.lovable.app/vitrine/${v.id}`;
 
   // Detecta se cliente quer ver outros veículos ou simular financiamento
   const querOutrosVeiculos = /\b(outros?|mais|tem (mais|outros?)|ver (mais|outros?)|que mais|que outros?|outro (carro|moto|veículo)|mais (carro|moto|opç))\b/i.test(mensagem);
@@ -310,7 +311,7 @@ async function responderFallback(veiculo, historico, mensagem) {
   } else {
     instrucao = `O cliente já disse como vai comprar. ${
       /financ/i.test(clienteTextos)
-        ? `Diga que a aprovação é facilitada inclusive para negativados e que ele pode simular direto em ${LINK_VITRINE}. SEM mencionar parcelas ou prestações. `
+        ? `Diga que a aprovação é facilitada inclusive para negativados e que ele pode simular direto em ${LINK_VEICULO}. SEM mencionar parcelas ou prestações. `
         : ''
     }Passe o link do WhatsApp da loja E peça o WhatsApp do cliente. Ex: "Chama a gente aqui: ${LINK_WPP} — qual o seu número para eu te chamar lá?" Máximo 2 frases. NUNCA mencione valores de parcela.`;
   }
@@ -331,7 +332,8 @@ ${v.observacoes ? '- Obs: ' + v.observacoes : ''}
 
 LINKS DISPONÍVEIS (use quando fizer sentido):
 - WhatsApp da loja: ${LINK_WPP}  ← SEMPRE use este link, NUNCA o número puro
-- Vitrine/catálogo: ${LINK_VITRINE}  ← use quando cliente quiser ver mais veículos ou simular financiamento
+- Este veículo na vitrine: ${LINK_VEICULO}  ← use quando cliente quiser ver fotos/detalhes/simular financiamento
+- Vitrine completa: ${LINK_VITRINE}  ← use quando cliente quiser ver outros veículos
 
 OBJETIVO: Pegar WhatsApp do cliente → Engajar → Coletar forma de compra → Converter.
 PRIORIDADE MÁXIMA: conseguir o número do cliente. Tudo mais é secundário.
