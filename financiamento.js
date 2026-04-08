@@ -186,9 +186,18 @@ async function selecionarOpcao(page, seletor, valor) {
 async function enviarFicha(ficha) {
   log.info(`[financiamento] Iniciando envio ficha ${ficha.id} — ${ficha.nome}`);
 
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext();
-  const page    = await context.newPage();
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
+  });
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    viewport: { width: 1280, height: 800 },
+  });
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  });
+  const page = await context.newPage();
 
   try {
     // ── 1. Login ─────────────────────────────────────────────────────────────
@@ -200,7 +209,8 @@ async function enviarFicha(ficha) {
     await loginInput.fill(AQUI_LOGIN);
     await senhaInput.fill(AQUI_SENHA);
     await page.click('input[type="submit"], button[type="submit"], button');
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(5000);
+    log.info(`[financiamento] URL pós-login: ${page.url()}`);
     // Verifica se o login funcionou (redireciona para fora do login)
     if (page.url().includes('index.php') || page.url().includes('login')) {
       throw new Error('Falha no login — verifique AQUI_LOGIN e AQUI_SENHA no .env');
