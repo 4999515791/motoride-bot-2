@@ -284,6 +284,21 @@ async function responderFallback(veiculo, historico, mensagem) {
     return `Tudo bem, sem problema! Se mudar de ideia ou quiser ver outro veículo, é só chamar. Bom dia!`;
   }
 
+  const LINK_WPP    = 'https://wa.me/5549998351418';
+  const LINK_VITRINE = 'https://crmmotoride.lovable.app/vitrine';
+
+  // Detecta se cliente quer ver outros veículos ou simular financiamento
+  const querOutrosVeiculos = /\b(outros?|mais|tem (mais|outros?)|ver (mais|outros?)|que mais|que outros?|outro (carro|moto|veículo)|mais (carro|moto|opç))\b/i.test(mensagem);
+  const querSimularFinanc  = /\b(simul|calcul|quanto fica|parcela|prestação|quanto por mês|quanto sai)\b/i.test(mensagem);
+
+  // Resposta imediata para quem quer ver vitrine ou simular — sem passar pelo Claude
+  if (querOutrosVeiculos || querSimularFinanc) {
+    const acao = querSimularFinanc
+      ? `Pode simular direto pelo nosso site e ver todos os veículos: ${LINK_VITRINE}`
+      : `Temos vários veículos disponíveis, dá uma olhada: ${LINK_VITRINE}`;
+    return `${acao} Me passa seu WhatsApp que eu te ajudo pessoalmente: ${LINK_WPP}`;
+  }
+
   // ── Monta instrução adaptada ao estágio real da conversa ────────────────────
   let instrucao;
   if (nMsgsCliente === 0) {
@@ -295,9 +310,9 @@ async function responderFallback(veiculo, historico, mensagem) {
   } else {
     instrucao = `O cliente já disse como vai comprar. ${
       /financ/i.test(clienteTextos)
-        ? 'Diga que a aprovação é facilitada inclusive para negativados, SEM mencionar parcelas ou prestações. '
+        ? `Diga que a aprovação é facilitada inclusive para negativados e que ele pode simular direto em ${LINK_VITRINE}. SEM mencionar parcelas ou prestações. `
         : ''
-    }Passe o número da loja E peça o WhatsApp do cliente. Ex: "Nosso WhatsApp é (49) 998351418. Qual o seu para eu te chamar lá?" Máximo 2 frases. NUNCA mencione valores de parcela.`;
+    }Passe o link do WhatsApp da loja E peça o WhatsApp do cliente. Ex: "Chama a gente aqui: ${LINK_WPP} — qual o seu número para eu te chamar lá?" Máximo 2 frases. NUNCA mencione valores de parcela.`;
   }
 
   const system = `Você é João, vendedor da MotoRide em Curitibanos-SC. Tom natural, humano, direto — sem parecer robô, sem emojis, sem asteriscos, sem textos longos.
@@ -314,18 +329,23 @@ VEÍCULO EM NEGOCIAÇÃO:
 - Financiamento: ${v.financiamento}
 ${v.observacoes ? '- Obs: ' + v.observacoes : ''}
 
-OBJETIVO: Engajar → Coletar cidade e forma de compra → Direcionar para WhatsApp (49) 998351418 → Converter.
+LINKS DISPONÍVEIS (use quando fizer sentido):
+- WhatsApp da loja: ${LINK_WPP}  ← SEMPRE use este link, NUNCA o número puro
+- Vitrine/catálogo: ${LINK_VITRINE}  ← use quando cliente quiser ver mais veículos ou simular financiamento
+
+OBJETIVO: Pegar WhatsApp do cliente → Engajar → Coletar forma de compra → Converter.
+PRIORIDADE MÁXIMA: conseguir o número do cliente. Tudo mais é secundário.
 
 REGRAS ABSOLUTAS:
 - Máximo 2 frases por resposta
 - Nunca fazer mais de 1 pergunta por vez
-- NÃO repita perguntas que o cliente já respondeu — leia o histórico antes de perguntar
+- NÃO repita perguntas que o cliente já respondeu — leia o histórico
 - NÃO pergunte forma de compra se o cliente já disse como vai comprar
 - NÃO peça WhatsApp se o cliente já passou o número
 - Não inventar informações do veículo
 - Nunca usar emojis, asteriscos ou markdown
-- PROIBIDO mencionar valor de parcela, prestação ou simulação de financiamento
-- PROIBIDO inventar cálculos como "R$ 2.700 por mês" ou qualquer valor de parcela
+- SEMPRE use o link ${LINK_WPP} em vez do número puro quando mencionar WhatsApp da loja
+- PROIBIDO mencionar valor de parcela, prestação ou simulação numérica de financiamento
 
 INSTRUÇÃO PARA ESTA MENSAGEM: ${instrucao}`;
 
@@ -334,15 +354,19 @@ INSTRUÇÃO PARA ESTA MENSAGEM: ${instrucao}`;
 
   const res = await claude.messages.create({
     model: 'claude-haiku-4-5-20251001',
-    max_tokens: 120,
+    max_tokens: 150,
     system,
     messages: msgs
   });
   let resposta = res.content[0].text.trim().replace(/\*\*/g, '').replace(/\*/g, '').replace(/[🏍🚗🚙🏎🤝👍👋🔥💪✅📱🙌]/gu, '').trim();
 
-  // Garante que o número da loja está na resposta quando o estágio é pedir WhatsApp
-  if (!temWppCliente && temForma && /whatsapp/i.test(resposta) && !/998351418/.test(resposta)) {
-    resposta += ' (49) 998351418';
+  // Garante link wa.me se o Claude colocou número puro
+  resposta = resposta.replace(/\(49\)\s*998[.\s-]?351[.\s-]?418/g, LINK_WPP);
+  resposta = resposta.replace(/49\s*998351418/g, LINK_WPP);
+
+  // Garante que link está na resposta quando estágio é pedir WhatsApp
+  if (!temWppCliente && temForma && !/wa\.me/.test(resposta)) {
+    resposta += ` ${LINK_WPP}`;
   }
 
   return resposta;
@@ -352,12 +376,9 @@ async function responder(veiculo, historico, mensagem) {
   return responderFallback(veiculo, historico, mensagem);
 }
 
-function responderForaDeEstoque(vehicleHint, ativos) {
+function responderForaDeEstoque(vehicleHint) {
   const mencionado = vehicleHint ? vehicleHint.trim() : 'esse veículo';
-  const lista = ativos.slice(0, 4)
-    .map(v => `${v.marca} ${v.modeloMkt || v.modelo} ${v.ano} por R$ ${Number(v.preco).toLocaleString('pt-BR')}`)
-    .join(', ');
-  return `Infelizmente o ${mencionado} não temos mais em estoque. Só esse modelo te interessa ou posso te mostrar outros que temos disponíveis? Temos: ${lista}.`;
+  return `Infelizmente o ${mencionado} não está mais disponível. Temos outros veículos, dá uma olhada: https://crmmotoride.lovable.app/vitrine — me passa seu WhatsApp que te ajudo a escolher: https://wa.me/5549998351418`;
 }
 
 // ── Verifica se deve enviar follow-up (cliente sumiu após nossa resposta) ──────
