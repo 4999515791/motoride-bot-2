@@ -171,7 +171,13 @@ async function preencherCampo(page, seletor, valor) {
   try {
     await page.fill(seletor, String(valor));
   } catch {
-    // campo inexistente ou oculto — ignora silenciosamente
+    // Fallback: força via JS (funciona em campos disabled)
+    try {
+      await page.evaluate((sel, val) => {
+        const el = document.querySelector(sel);
+        if (el) { el.disabled = false; el.value = val; el.dispatchEvent(new Event('change', { bubbles: true })); }
+      }, seletor, String(valor));
+    } catch {}
   }
 }
 
@@ -252,7 +258,11 @@ async function enviarFicha(ficha) {
       await selecionarOpcao(page, '#parcelas', String(PARCELAS_ID[String(ficha.num_parcelas)] || 3));
     }
     if (ficha.valor_parcela) {
-      await page.fill('#parcela', Number(ficha.valor_parcela).toFixed(2));
+      const valorParcela = Number(ficha.valor_parcela).toFixed(2);
+      await page.evaluate((val) => {
+        const el = document.getElementById('parcela');
+        if (el) { el.disabled = false; el.classList.remove('disabled'); el.value = val; el.dispatchEvent(new Event('change', { bubbles: true })); }
+      }, valorParcela);
     }
 
     log.ok('[financiamento] Simulação preenchida');
