@@ -252,6 +252,22 @@ async function enviarFicha(ficha) {
     }
 
     await page.evaluate((d) => {
+      function setVal(id, val) {
+        const el = document.getElementById(id) || document.querySelector(`[name="${id}"]`);
+        if (!el || val === null || val === undefined || val === '') return;
+        el.disabled = false;
+        el.classList.remove('disabled');
+        if (el.tagName === 'SELECT') {
+          for (const opt of el.options) {
+            if (opt.value === String(val) || opt.text === String(val)) { el.value = opt.value; break; }
+          }
+        } else {
+          el.value = String(val);
+        }
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new Event('input',  { bubbles: true }));
+      }
+
       // Simulação
       setVal('idTabela', d.idTabela);
       setVal('anoItem',  d.vAno);
