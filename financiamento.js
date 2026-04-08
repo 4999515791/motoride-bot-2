@@ -229,6 +229,8 @@ async function enviarFicha(ficha) {
     await page.goto(AQUI_URL_FICHA, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(3000);
     log.info(`[financiamento] URL formulário: ${page.url()}`);
+    await page.screenshot({ path: path.join(__dirname, 'logs', `ficha-${ficha.id}-form.png`), fullPage: false });
+    log.info('[financiamento] Screenshot do formulário salvo em logs/');
 
     // ── 2 a 7. Preenche TODO o formulário via JS (evita problemas com campos disabled) ──
     const vAnо   = extrairAno(ficha.veiculo_label);
