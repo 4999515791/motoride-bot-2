@@ -176,14 +176,23 @@ async function enviarHeartbeat(configId) {
 // ── Extrai número de WhatsApp de uma mensagem ────────────
 function extrairWhatsApp(texto) {
   if (!texto) return null;
-  // Padrões: (49) 99951-5791 | 49999515791 | +5549999515791 | 99951-5791
-  const match = texto.match(/(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?\d{4,5}[-\s]?\d{4}/);
-  if (!match) return null;
-  const digits = match[0].replace(/\D/g, '');
-  if (digits.length < 8 || digits.length > 13) return null;
-  // Ignora os números da própria loja para não salvar como WhatsApp do cliente
-  if (digits.includes('998351418') || digits.includes('999515791')) return null;
-  return digits;
+  // Tenta múltiplos padrões em ordem de especificidade
+  const padroes = [
+    /\+?55\s?\(?\d{2}\)?\s?9?\d{4}[-\s]?\d{4}/,   // +55 (49) 99951-5791
+    /\(?\d{2}\)?\s?9\d{4}[-\s]?\d{4}/,              // (49) 99951-5791
+    /\(?\d{2}\)?\s?\d{4}[-\s]?\d{4}/,               // (49) 9951-5791
+    /\b\d{10,11}\b/,                                  // 49999515791
+  ];
+  for (const p of padroes) {
+    const match = texto.match(p);
+    if (!match) continue;
+    const digits = match[0].replace(/\D/g, '');
+    if (digits.length < 10 || digits.length > 13) continue;
+    // Ignora os números da própria loja para não salvar como WhatsApp do cliente
+    if (digits.includes('998351418') || digits.includes('999515791')) continue;
+    return digits;
+  }
+  return null;
 }
 
 // ── Cria lead no CRM via Edge Function (bot-create-lead) ─────────────────────
@@ -258,28 +267,37 @@ async function responderFallback(veiculo, historico, mensagem) {
     return `Vi que você mandou um áudio, mas aqui no chat não consigo ouvir. Pode me contar em texto o que quer saber sobre ${nome}?`;
   }
 
-  // Analisa o que já foi coletado no histórico
-  const todasTextos  = hist.map(m => m.texto).join(' ');
-  const clienteTextos = hist.filter(m => m.de === 'cliente').map(m => m.texto).join(' ');
-  const temForma      = /\b(financ|à vista|avista|troca|trocar|entrada)\b/i.test(todasTextos);
-  // Verifica se o CLIENTE mandou o número dele (não conta o número da loja que nós enviamos)
+  // ── Analisa TODO o contexto disponível, incluindo a mensagem atual ──────────
+  // IMPORTANTE: inclui `mensagem` (msg atual do cliente) para não perder informações
+  // que chegaram agora (WhatsApp, forma de compra, etc.)
+  const todasTextos   = hist.map(m => m.texto).join(' ') + ' ' + mensagem;
+  const clienteTextos = hist.filter(m => m.de === 'cliente').map(m => m.texto).join(' ') + ' ' + mensagem;
+
+  const temForma      = /\b(financ|à vista|avista|troca|trocar|entrada|dinheiro|pix|boleto|parcel)\b/i.test(clienteTextos);
   const telCliente    = extrairWhatsApp(clienteTextos);
   const temWppCliente = telCliente !== null;
 
-  // Monta instrução adaptada ao estágio da conversa
+  // Detecta sinais de desistência/desinteresse do cliente
+  const clienteDesistiu = /\b(n[aã]o (tenho|quero|vou|consigo)|desisti|mudei de ideia|j[aá] comprei|n[aã]o preciso|obrigad[oa] n[aã]o|t[aá] caro|muito caro|acima do (meu )?pre[çc]o|n[aã]o tenho grana|sem dinheiro|n[aã]o vou poder)\b/i.test(mensagem);
+
+  if (clienteDesistiu) {
+    return `Tudo bem, sem problema! Se mudar de ideia ou quiser ver outro veículo, é só chamar. Bom dia!`;
+  }
+
+  // ── Monta instrução adaptada ao estágio real da conversa ────────────────────
   let instrucao;
   if (nMsgsCliente === 0) {
     instrucao = `PRIMEIRO CONTATO. Confirme que o veículo está disponível e pergunte a cidade do cliente. Máximo 2 frases curtas. Não peça WhatsApp ainda.`;
+  } else if (temWppCliente) {
+    instrucao = `O cliente já passou o WhatsApp dele (${telCliente}). Confirme que vai chamar por lá e encerre a conversa do Marketplace de forma simpática. 1 frase apenas. NÃO peça mais nada.`;
   } else if (!temForma) {
-    instrucao = `Já respondeu o contato inicial. Agora pergunte de forma natural como o cliente pretende comprar: financiado, à vista ou tem troca. 1 pergunta apenas.`;
-  } else if (!temWppCliente) {
-    instrucao = `Já sabe a forma de compra. ${
-      /financ/i.test(todasTextos)
-        ? 'Diga apenas que a aprovação é facilitada inclusive para negativados, SEM mencionar nenhum valor de parcela ou prestação — os detalhes são passados no WhatsApp. '
-        : ''
-    }Passe o número da loja E peça o WhatsApp do cliente em frases separadas. Exemplo: "Nosso WhatsApp é (49) 998351418. Qual o seu para eu te chamar lá?" NUNCA mencione parcelas ou valores de financiamento. Máximo 2 frases.`;
+    instrucao = `ATENÇÃO: leia a mensagem atual antes de responder — se o cliente JÁ respondeu como vai comprar, não pergunte de novo. Se ainda não respondeu, pergunte de forma natural: financiado, à vista ou tem troca? 1 pergunta apenas.`;
   } else {
-    instrucao = `Cliente já mandou o WhatsApp dele (${telCliente}). Confirme que vai chamar por lá e encerre a conversa do Marketplace de forma simpática. 1 frase.`;
+    instrucao = `O cliente já disse como vai comprar. ${
+      /financ/i.test(clienteTextos)
+        ? 'Diga que a aprovação é facilitada inclusive para negativados, SEM mencionar parcelas ou prestações. '
+        : ''
+    }Passe o número da loja E peça o WhatsApp do cliente. Ex: "Nosso WhatsApp é (49) 998351418. Qual o seu para eu te chamar lá?" Máximo 2 frases. NUNCA mencione valores de parcela.`;
   }
 
   const system = `Você é João, vendedor da MotoRide em Curitibanos-SC. Tom natural, humano, direto — sem parecer robô, sem emojis, sem asteriscos, sem textos longos.
@@ -298,19 +316,20 @@ ${v.observacoes ? '- Obs: ' + v.observacoes : ''}
 
 OBJETIVO: Engajar → Coletar cidade e forma de compra → Direcionar para WhatsApp (49) 998351418 → Converter.
 
-REGRAS:
+REGRAS ABSOLUTAS:
 - Máximo 2 frases por resposta
 - Nunca fazer mais de 1 pergunta por vez
-- Não parecer formulário
+- NÃO repita perguntas que o cliente já respondeu — leia o histórico antes de perguntar
+- NÃO pergunte forma de compra se o cliente já disse como vai comprar
+- NÃO peça WhatsApp se o cliente já passou o número
 - Não inventar informações do veículo
 - Nunca usar emojis, asteriscos ou markdown
-- Sempre conduzir para o próximo passo
-- PROIBIDO mencionar valor de parcela, prestação ou simulação de financiamento — você não tem tabela de financiamento. Diga apenas que trabalha com aprovação facilitada e que os detalhes são passados no WhatsApp
+- PROIBIDO mencionar valor de parcela, prestação ou simulação de financiamento
 - PROIBIDO inventar cálculos como "R$ 2.700 por mês" ou qualquer valor de parcela
 
 INSTRUÇÃO PARA ESTA MENSAGEM: ${instrucao}`;
 
-  const msgs = hist.slice(-10).map(m => ({ role: m.de === 'eu' ? 'assistant' : 'user', content: m.texto }));
+  const msgs = hist.slice(-12).map(m => ({ role: m.de === 'eu' ? 'assistant' : 'user', content: m.texto }));
   msgs.push({ role: 'user', content: mensagem });
 
   const res = await claude.messages.create({
@@ -321,8 +340,8 @@ INSTRUÇÃO PARA ESTA MENSAGEM: ${instrucao}`;
   });
   let resposta = res.content[0].text.trim().replace(/\*\*/g, '').replace(/\*/g, '').replace(/[🏍🚗🚙🏎🤝👍👋🔥💪✅📱🙌]/gu, '').trim();
 
-  // Garante que o número da loja está na resposta quando o estágio é WhatsApp
-  if (!temWppCliente && /whatsapp/i.test(resposta) && !/998351418/.test(resposta)) {
+  // Garante que o número da loja está na resposta quando o estágio é pedir WhatsApp
+  if (!temWppCliente && temForma && /whatsapp/i.test(resposta) && !/998351418/.test(resposta)) {
     resposta += ' (49) 998351418';
   }
 
