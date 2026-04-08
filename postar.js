@@ -172,6 +172,7 @@ async function carregarVeiculosSupabase() {
           status:         row.status || 'ativo',
           ultimaPostagem: row.ultima_postagem || null,
           fotoCapaIndex:  row.foto_capa_index || 0,
+          fotosCapas:     row.fotos_capas || [],
         };
         result[v.id] = v;
       }
@@ -246,7 +247,24 @@ async function baixarFoto(vehicleId, nome, destino) {
   });
 }
 
-async function getFotosVeiculo(vehicleId, pastaFotosLocal, indiceAtual = 0, vehicleUuid = null) {
+// Seleciona fotos respeitando fotosCapas (se definido) ou rotação normal
+function selecionarFotos(todas, indiceAtual, fotosCapas = []) {
+  if (fotosCapas.length > 0) {
+    const capas = todas.filter(c => fotosCapas.some(fc => path.basename(c).toLowerCase() === fc.toLowerCase()));
+    if (capas.length > 0) {
+      const indice = indiceAtual % capas.length;
+      const capa = capas[indice];
+      const resto = todas.filter(c => c !== capa);
+      return { fotos: [capa, ...resto].slice(0, 20), proximoIndice: (indice + 1) % capas.length };
+    }
+    log.warn(`[Capa] fotosCapas definidas mas não encontradas nas fotos — usando rotação normal`);
+  }
+  const indice = indiceAtual % todas.length;
+  const rotacionadas = [...todas.slice(indice), ...todas.slice(0, indice)];
+  return { fotos: rotacionadas.slice(0, 20), proximoIndice: (indice + 1) % todas.length };
+}
+
+async function getFotosVeiculo(vehicleId, pastaFotosLocal, indiceAtual = 0, vehicleUuid = null, fotosCapas = []) {
   // 1) Tenta Supabase Storage — primeiro pelo local_id, depois pelo UUID (fotos enviadas pelo CRM)
   if (SUPABASE_URL && SUPABASE_ANON_KEY) {
     let nomes = await listarFotosStorage(vehicleId);
@@ -273,9 +291,8 @@ async function getFotosVeiculo(vehicleId, pastaFotosLocal, indiceAtual = 0, vehi
       }
       if (caminhos.length > 0) {
         log.ok(`[Storage] ${caminhos.length} foto(s) baixada(s) para temp`);
-        const indice = indiceAtual % caminhos.length;
-        const rotacionadas = [...caminhos.slice(indice), ...caminhos.slice(0, indice)];
-        return { fotos: rotacionadas.slice(0, 20), proximoIndice: (indice + 1) % caminhos.length, fonte: 'storage' };
+        const { fotos, proximoIndice } = selecionarFotos(caminhos, indiceAtual, fotosCapas);
+        return { fotos, proximoIndice, fonte: 'storage' };
       }
     }
   }
@@ -288,9 +305,8 @@ async function getFotosVeiculo(vehicleId, pastaFotosLocal, indiceAtual = 0, vehi
     .sort()
     .map(f => path.join(dir, f));
   if (todas.length === 0) return { fotos: [], proximoIndice: 0, fonte: 'local' };
-  const indice = indiceAtual % todas.length;
-  const rotacionadas = [...todas.slice(indice), ...todas.slice(0, indice)];
-  return { fotos: rotacionadas.slice(0, 20), proximoIndice: (indice + 1) % todas.length, fonte: 'local' };
+  const { fotos, proximoIndice } = selecionarFotos(todas, indiceAtual, fotosCapas);
+  return { fotos, proximoIndice, fonte: 'local' };
 }
 
 function limparTempVeiculo(vehicleId) {
@@ -579,12 +595,12 @@ async function selecionarGrupos(page, max = 20) {
 
 // ── LÓGICA DE POSTAGEM (extraída para reutilizar no daemon) ───────────────────
 async function postarVeiculo(page, v) {
-  const { fotos, proximoIndice, fonte } = await getFotosVeiculo(v.id, v.pastaFotos || '', v.fotoCapaIndex || 0, v.uuid || null);
+  const { fotos, proximoIndice, fonte } = await getFotosVeiculo(v.id, v.pastaFotos || '', v.fotoCapaIndex || 0, v.uuid || null, v.fotosCapas || []);
   if (fotos.length === 0) {
     throw new Error(`Nenhuma foto encontrada para ${v.id} — faça upload no CRM ou na pasta local`);
   }
-  const indiceCapa = v.fotoCapaIndex || 0;
-  log.info(`Fotos: ${fotos.length} encontrada(s) [${fonte}] — foto de capa: índice ${indiceCapa} (${path.basename(fotos[0])})`);
+  const capasInfo = (v.fotosCapas || []).length > 0 ? ` | capas definidas: [${v.fotosCapas.join(', ')}]` : '';
+  log.info(`Fotos: ${fotos.length} encontrada(s) [${fonte}] — capa: ${path.basename(fotos[0])}${capasInfo}`);
 
   log.info('Gerando descrição...');
   const descricao = await gerarDescricao(v);
