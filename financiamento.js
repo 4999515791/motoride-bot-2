@@ -20,7 +20,7 @@ const AQUI_TEL          = process.env.AQUI_TEL      || '999515791';
 const AQUI_NOME_CONTATO = process.env.AQUI_NOME_CONTATO || 'MotoRide Curitibanos';
 const AQUI_EMAIL        = process.env.AQUI_EMAIL    || 'motoridesc@gmail.com';
 
-const AQUI_URL_LOGIN    = 'https://www.aquifinanciamentos.com.br/loja/loginLoja.php';
+const AQUI_URL_LOGIN    = 'https://www.aquifinanciamentos.com.br/loja/index.php';
 
 // ── Supabase REST helpers ─────────────────────────────────────────────────────
 
@@ -72,7 +72,12 @@ async function buscarProximaFicha() {
   const rows = await supabaseGet(
     'financiamento_fichas?status=eq.pendente&order=created_at.asc&limit=1'
   );
-  return Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
+  if (!Array.isArray(rows)) {
+    log.warn(`[financiamento] Resposta inesperada do Supabase: ${JSON.stringify(rows)}`);
+    return null;
+  }
+  log.info(`[financiamento] Fichas pendentes encontradas: ${rows.length}`);
+  return rows.length > 0 ? rows[0] : null;
 }
 
 async function buscarFichaPorId(id) {
@@ -100,6 +105,52 @@ async function marcarErro(id, msg) {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Converte data ISO (YYYY-MM-DD) ou já em dd/mm/yyyy para dd/mm/yyyy
+function formatarData(val) {
+  if (!val) return '';
+  if (/^\d{4}-\d{2}-\d{2}/.test(val)) {
+    const [y, m, d] = val.split('T')[0].split('-');
+    return `${d}/${m}/${y}`;
+  }
+  return val; // já está no formato correto
+}
+
+// Formata CPF: 12345678900 → 123.456.789-00
+function formatarCPF(val) {
+  if (!val) return '';
+  const digits = String(val).replace(/\D/g, '');
+  if (digits.length !== 11) return val;
+  return `${digits.slice(0,3)}.${digits.slice(3,6)}.${digits.slice(6,9)}-${digits.slice(9)}`;
+}
+
+// Remove tudo que não for dígito de um número de telefone
+function apenasDigitos(val) {
+  if (!val) return '';
+  return String(val).replace(/\D/g, '');
+}
+
+// Extrai ano do veiculo_label: "Honda Biz 100 ES 2013" → "2013"
+function extrairAno(label) {
+  const m = (label || '').match(/\b(19|20)\d{2}\b/);
+  return m ? m[0] : String(new Date().getFullYear());
+}
+
+// Extrai marca: "Honda Biz 100 ES 2013" → "Honda"
+function extrairMarca(label) {
+  return (label || '').trim().split(' ')[0] || '';
+}
+
+// Extrai modelo: "Honda Biz 100 ES 2013" → "Biz 100"
+function extrairModelo(label) {
+  const partes = (label || '').trim().split(' ');
+  if (partes.length <= 1) return label || '';
+  const semMarca = partes.slice(1);
+  // Remove versão (1 token) e ano (último token se 4 dígitos)
+  if (/^(19|20)\d{2}$/.test(semMarca[semMarca.length - 1])) semMarca.pop();
+  if (semMarca.length > 2) semMarca.pop(); // remove versão (ES, EX, LT, etc.)
+  return semMarca.join(' ');
+}
 
 // Retorna id do select "Método de Financiamento": leve=5, pesada=4
 function idTabelaFinanciamento(tabela_fin) {
@@ -142,16 +193,28 @@ async function enviarFicha(ficha) {
   try {
     // ── 1. Login ─────────────────────────────────────────────────────────────
     await page.goto(AQUI_URL_LOGIN, { waitUntil: 'domcontentloaded' });
-    await page.fill('input[name="login"], input[type="text"]:first-of-type', AQUI_LOGIN);
-    await page.fill('input[name="senha"], input[type="password"]', AQUI_SENHA);
-    await page.click('input[type="submit"], button');
-    await page.waitForURL('**/novaFichaCadastral.php', { timeout: 15000 });
+    // Preenche login e senha (tenta os seletores mais comuns de forms PHP)
+    const loginInput = await page.$('input[name="login"]') || await page.$('input[name="usuario"]') || await page.$('input[type="text"]');
+    const senhaInput = await page.$('input[name="senha"]') || await page.$('input[type="password"]');
+    if (!loginInput || !senhaInput) throw new Error('Campos de login não encontrados na página');
+    await loginInput.fill(AQUI_LOGIN);
+    await senhaInput.fill(AQUI_SENHA);
+    await page.click('input[type="submit"], button[type="submit"], button');
+    await page.waitForTimeout(3000);
+    // Verifica se o login funcionou (redireciona para fora do login)
+    if (page.url().includes('index.php') || page.url().includes('login')) {
+      throw new Error('Falha no login — verifique AQUI_LOGIN e AQUI_SENHA no .env');
+    }
     log.ok('[financiamento] Login realizado');
 
     // ── 2. Simulação / Método de Financiamento ────────────────────────────────
+    const vAnо   = extrairAno(ficha.veiculo_label);
+    const vMarca  = extrairMarca(ficha.veiculo_label);
+    const vModelo = extrairModelo(ficha.veiculo_label);
+
     const idTabela = idTabelaFinanciamento(ficha.tabela_fin);
     await selecionarOpcao(page, '#idTabela', idTabela);
-    await selecionarOpcao(page, '#anoItem',  String(ficha.veiculo_ano || '2013'));
+    await selecionarOpcao(page, '#anoItem',  vAnо);
 
     // Habilita os campos de simulação (que começam desabilitados)
     await page.evaluate(() => {
@@ -179,11 +242,11 @@ async function enviarFicha(ficha) {
 
     // ── 3. Dados Pessoais ─────────────────────────────────────────────────────
     await preencherCampo(page, '#nome',       ficha.nome);
-    await preencherCampo(page, '#nascimento', ficha.nascimento);
+    await preencherCampo(page, '#nascimento', formatarData(ficha.nascimento));
     await preencherCampo(page, '#mae',        ficha.mae);
-    await preencherCampo(page, '#cpf',        ficha.cpf);
-    await preencherCampo(page, '#dddcelular', ficha.ddd_celular);
-    await preencherCampo(page, '#celular',    ficha.celular);
+    await preencherCampo(page, '#cpf',        formatarCPF(ficha.cpf));
+    await preencherCampo(page, '#dddcelular', apenasDigitos(ficha.ddd_celular));
+    await preencherCampo(page, '#celular',    apenasDigitos(ficha.celular));
     await preencherCampo(page, '#cep',        ficha.cep);
     await preencherCampo(page, '#endereco',   ficha.endereco);
     await preencherCampo(page, '#num',        ficha.num_end);
@@ -194,9 +257,7 @@ async function enviarFicha(ficha) {
     if (ficha.moradia) {
       await selecionarOpcao(page, '#moradia', ficha.moradia === 'Própria' ? 'Própria' : 'Alugada');
     }
-    if (ficha.anos_residencia) {
-      await preencherCampo(page, '#anores', ficha.anos_residencia);
-    }
+    await preencherCampo(page, '#anores', ficha.anos_residencia || '1');
 
     // Sexo padrão M
     await page.evaluate(() => {
@@ -215,8 +276,8 @@ async function enviarFicha(ficha) {
     await preencherCampo(page, '#bairroemp',   ficha.bairro_emp);
     await preencherCampo(page, '#cidadeemp',   ficha.cidade_emp);
     await preencherCampo(page, '#ufemp',       ficha.uf_emp);
-    await preencherCampo(page, '#dddtelemp',   ficha.ddd_tel_emp);
-    await preencherCampo(page, '#telemp',      ficha.tel_emp);
+    await preencherCampo(page, '#dddtelemp',   apenasDigitos(ficha.ddd_tel_emp));
+    await preencherCampo(page, '#telemp',      apenasDigitos(ficha.tel_emp));
     await preencherCampo(page, '#funcao',      ficha.funcao);
     await preencherCampo(page, '#rendab',      ficha.renda_bruta);
 
@@ -225,23 +286,23 @@ async function enviarFicha(ficha) {
     // ── 5. Referências ────────────────────────────────────────────────────────
     if (ficha.ref1_nome) {
       await preencherCampo(page, '#ref1',       ficha.ref1_nome);
-      await preencherCampo(page, '#dddtelref1', ficha.ref1_ddd);
-      await preencherCampo(page, '#telref1',    ficha.ref1_tel);
+      await preencherCampo(page, '#dddtelref1', apenasDigitos(ficha.ref1_ddd));
+      await preencherCampo(page, '#telref1',    apenasDigitos(ficha.ref1_tel));
     }
     if (ficha.ref2_nome) {
       await preencherCampo(page, '#ref2',       ficha.ref2_nome);
-      await preencherCampo(page, '#dddtelref2', ficha.ref2_ddd);
-      await preencherCampo(page, '#telref2',    ficha.ref2_tel);
+      await preencherCampo(page, '#dddtelref2', apenasDigitos(ficha.ref2_ddd));
+      await preencherCampo(page, '#telref2',    apenasDigitos(ficha.ref2_tel));
     }
 
     log.ok('[financiamento] Referências preenchidas');
 
     // ── 6. Dados da Garantia (Moto — preenchidos pelo sistema) ───────────────
-    await preencherCampo(page, '#marca',     ficha.veiculo_marca);
-    await preencherCampo(page, '#modelo',    ficha.veiculo_modelo);
-    await preencherCampo(page, '#fabricacao', ficha.veiculo_ano);
-    await preencherCampo(page, '#amodelo',   ficha.veiculo_ano);
-    await preencherCampo(page, '#placa',     ficha.veiculo_placa);
+    await preencherCampo(page, '#marca',      vMarca);
+    await preencherCampo(page, '#modelo',     vModelo);
+    await preencherCampo(page, '#fabricacao', vAnо);
+    await preencherCampo(page, '#amodelo',    vAnо);
+    await preencherCampo(page, '#placa',      ficha.veiculo_placa || '');
 
     // Tipo: Moto
     await page.evaluate(() => {
@@ -291,11 +352,33 @@ async function enviarFicha(ficha) {
 
     const urlAtual  = page.url();
     const conteudo  = (await page.content()).toLowerCase();
-    const temErro   = conteudo.includes('erro') || urlAtual.includes('loginLoja');
     const temSucesso = conteudo.includes('sucesso') || conteudo.includes('enviado') || conteudo.includes('obrigado');
 
+    // Extrai mensagens de erro do div de erros do formulário
+    const errosForm = await page.evaluate(() => {
+      const divErros = document.getElementById('divErros') || document.querySelector('.erros, .erro, [class*="erro"]');
+      if (!divErros) return null;
+      return divErros.innerText.trim();
+    });
+
+    if (errosForm) {
+      log.warn(`[financiamento] Erros do formulário:\n${errosForm}`);
+    }
+
+    // Campos em vermelho/laranja
+    const camposInvalidos = await page.evaluate(() => {
+      const campos = document.querySelectorAll('input.erro, input[style*="background: red"], input[style*="background:red"], input[style*="background: orange"], select.erro');
+      return Array.from(campos).map(el => el.id || el.name || el.className).filter(Boolean);
+    });
+    if (camposInvalidos.length > 0) {
+      log.warn(`[financiamento] Campos inválidos: ${camposInvalidos.join(', ')}`);
+    }
+
+    const temErro = (errosForm && errosForm.length > 0) || urlAtual.includes('loginLoja') ||
+                    (!temSucesso && conteudo.includes('divErros'));
+
     if (temErro && !temSucesso) {
-      throw new Error(`Formulário retornou erro. URL: ${urlAtual}`);
+      throw new Error(`Formulário retornou erro. URL: ${urlAtual}${errosForm ? ' | Erros: ' + errosForm.substring(0, 200) : ''}`);
     }
 
     log.ok(`[financiamento] Ficha ${ficha.id} enviada com sucesso!`);
