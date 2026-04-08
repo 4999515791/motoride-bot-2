@@ -21,6 +21,7 @@ const AQUI_NOME_CONTATO = process.env.AQUI_NOME_CONTATO || 'MotoRide Curitibanos
 const AQUI_EMAIL        = process.env.AQUI_EMAIL    || 'motoridesc@gmail.com';
 
 const AQUI_URL_LOGIN    = 'https://www.aquifinanciamentos.com.br/loja/index.php';
+const AQUI_URL_FICHA   = 'https://www.aquifinanciamentos.com.br/loja/novaFichaCadastral.php';
 
 // ── Supabase REST helpers ─────────────────────────────────────────────────────
 
@@ -216,6 +217,12 @@ async function enviarFicha(ficha) {
       throw new Error('Falha no login — verifique AQUI_LOGIN e AQUI_SENHA no .env');
     }
     log.ok('[financiamento] Login realizado');
+
+    // ── Navega explicitamente para o formulário de nova ficha ─────────────────
+    log.info(`[financiamento] Abrindo formulário: ${AQUI_URL_FICHA}`);
+    await page.goto(AQUI_URL_FICHA, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(3000);
+    log.info(`[financiamento] URL formulário: ${page.url()}`);
 
     // ── 2. Simulação / Método de Financiamento ────────────────────────────────
     const vAnо   = extrairAno(ficha.veiculo_label);
