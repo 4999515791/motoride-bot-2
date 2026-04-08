@@ -827,7 +827,10 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
         if (deveRegistrar || deveAtualizar) {
           // Lê o nome do comprador: extrai da row (formato "Nome · Veículo") ou tenta DOM
           const nomeDoRow = rowText
-            ? rowText.split(' · ')[0].replace(/^\(\d+\)\s*/, '').trim()
+            ? rowText.split(' · ')[0]
+                .replace(/^\(\d+\)\s*/, '')
+                .replace(/^(online\s+agora|active\s+now|ativo\s+agora|disponível)\s*/i, '')
+                .trim()
             : '';
           const compradorNome = (nomeDoRow.length > 1 && nomeDoRow.length < 60 && !/messenger|facebook|marketplace|conversas|notifica/i.test(nomeDoRow))
             ? nomeDoRow
