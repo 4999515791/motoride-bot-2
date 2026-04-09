@@ -198,14 +198,31 @@ function extrairWhatsApp(texto) {
   return null;
 }
 
+// ── Classifica o lead com base no histórico da conversa ──────────────────────
+function classificarLead(historico, telefone) {
+  const clienteTextos = (historico || []).filter(m => m.de === 'cliente').map(m => m.texto).join(' ');
+  if (telefone) return 'WhatsApp captado';
+  const temFinanc = /\bfinanc\b/i.test(clienteTextos);
+  const temTroca  = /\b(troca|trocar)\b/i.test(clienteTextos);
+  const temVista  = /\b(à vista|avista|dinheiro|pix)\b/i.test(clienteTextos);
+  const temSimul  = /\b(simul|calcul|parcela|prestação)\b/i.test(clienteTextos);
+  if (temFinanc && temTroca) return 'Quer financiamento + Tem troca';
+  if (temFinanc) return 'Quer financiamento';
+  if (temVista)  return 'À vista';
+  if (temTroca)  return 'Tem troca';
+  if (temSimul)  return 'Quer simulação';
+  return 'Interesse inicial';
+}
+
 // ── Cria lead no CRM via Edge Function (bot-create-lead) ─────────────────────
 async function sincronizarLeadCRM(convId, compradorNome, veiculo, historico, telefone) {
   if (!SUPABASE_URL || !BOT_SECRET_TOKEN) return;
 
-  const nomeReal   = compradorNome.replace(/_/g, ' ').replace(/\d+/g, '').trim() || 'Lead Marketplace';
-  const interesse  = veiculo ? `Comprar ${veiculo.marca} ${veiculo.modelo} ${veiculo.ano}` : 'comprar moto';
-  const notas      = historico
-    ? `[Facebook Marketplace]\n` + historico.slice(-10).map(m => `${m.de === 'eu' ? 'Vendedor' : 'Cliente'}: ${m.texto}`).join('\n')
+  const nomeReal      = compradorNome.replace(/_/g, ' ').replace(/\d+/g, '').trim() || 'Lead Marketplace';
+  const interesse     = veiculo ? `Comprar ${veiculo.marca} ${veiculo.modelo} ${veiculo.ano}` : 'comprar moto';
+  const classificacao = classificarLead(historico, telefone);
+  const notas         = historico
+    ? `[Facebook Marketplace] Classificação: ${classificacao}\n` + historico.slice(-10).map(m => `${m.de === 'eu' ? 'Vendedor' : 'Cliente'}: ${m.texto}`).join('\n')
     : null;
 
   const result = await chamarEdgeFunction('bot-create-lead', {
@@ -218,7 +235,8 @@ async function sincronizarLeadCRM(convId, compradorNome, veiculo, historico, tel
     conv_id:         convId,
     bot_id:          BOT_ID,
     vehicle_label:   veiculo ? `${veiculo.marca} ${veiculo.modelo} ${veiculo.ano}` : null,
-    local_vehicle_id: veiculo?.id || null,  // ex: "v7" — CRM usa pra vincular ao stock_vehicles
+    local_vehicle_id: veiculo?.id || null,
+    classificacao,
   });
 
   if (!result || result.error) {
@@ -263,22 +281,19 @@ async function responderFallback(veiculo, historico, mensagem) {
   const v = veiculo;
   const hist = historico || [];
   const nMsgsCliente = hist.filter(m => m.de === 'cliente').length;
+  const nomeVeiculo = `${v.marca} ${v.modeloMkt || v.modelo} ${v.ano}`;
 
   // Mensagem de voz — pede para mandar em texto
   if (mensagem === '[áudio]') {
-    const nome = `o ${v.marca} ${v.modeloMkt || v.modelo} ${v.ano}`;
-    return `Vi que você mandou um áudio, mas aqui no chat não consigo ouvir. Pode me contar em texto o que quer saber sobre ${nome}?`;
+    return `Vi que você mandou um áudio, mas aqui no chat não consigo ouvir. Pode me contar em texto o que quer saber sobre o ${nomeVeiculo}?`;
   }
 
-  // Foto enviada pelo cliente — pede pra mandar no WhatsApp
+  // Foto enviada pelo cliente — direciona para WhatsApp do cliente (sem enviar nosso número)
   if (mensagem === '[foto]') {
-    return `Vi que você mandou foto, mas aqui no chat às vezes não carrega direito. Manda no WhatsApp (49) 998351418 que eu vejo tudo certinho e já te respondo por lá.`;
+    return `Vi que você mandou uma foto. Me passa seu WhatsApp que o especialista te chama por lá e consegue analisar certinho.`;
   }
 
   // ── Analisa TODO o contexto disponível, incluindo a mensagem atual ──────────
-  // IMPORTANTE: inclui `mensagem` (msg atual do cliente) para não perder informações
-  // que chegaram agora (WhatsApp, forma de compra, etc.)
-  const todasTextos   = hist.map(m => m.texto).join(' ') + ' ' + mensagem;
   const clienteTextos = hist.filter(m => m.de === 'cliente').map(m => m.texto).join(' ') + ' ' + mensagem;
 
   const temForma      = /\b(financ|à vista|avista|troca|trocar|entrada|dinheiro|pix|boleto|parcel)\b/i.test(clienteTextos);
@@ -289,23 +304,7 @@ async function responderFallback(veiculo, historico, mensagem) {
   const clienteDesistiu = /\b(n[aã]o (tenho|quero|vou|consigo)|desisti|mudei de ideia|j[aá] comprei|n[aã]o preciso|obrigad[oa] n[aã]o|t[aá] caro|muito caro|acima do (meu )?pre[çc]o|n[aã]o tenho grana|sem dinheiro|n[aã]o vou poder)\b/i.test(mensagem);
 
   if (clienteDesistiu) {
-    return `Tudo bem, sem problema! Se mudar de ideia ou quiser ver outro veículo, é só chamar. Bom dia!`;
-  }
-
-  const LINK_WPP     = 'https://api.whatsapp.com/send?phone=5549998351418';
-  const LINK_VITRINE = 'https://crmmotoride.lovable.app/vitrine';
-  const LINK_VEICULO = `https://crmmotoride.lovable.app/vitrine/${v.id}`;
-
-  // Detecta se cliente quer ver outros veículos ou simular financiamento
-  const querOutrosVeiculos = /\b(outros?|mais|tem (mais|outros?)|ver (mais|outros?)|que mais|que outros?|outro (carro|moto|veículo)|mais (carro|moto|opç))\b/i.test(mensagem);
-  const querSimularFinanc  = /\b(simul|calcul|quanto fica|parcela|prestação|quanto por mês|quanto sai)\b/i.test(mensagem);
-
-  // Resposta imediata para quem quer ver vitrine ou simular — sem passar pelo Claude
-  if (querOutrosVeiculos || querSimularFinanc) {
-    const acao = querSimularFinanc
-      ? `Pode simular direto pelo nosso site e ver todos os veículos: ${LINK_VITRINE}`
-      : `Temos vários veículos disponíveis, dá uma olhada: ${LINK_VITRINE}`;
-    return `${acao} Me passa seu WhatsApp que eu te ajudo pessoalmente: ${LINK_WPP}`;
+    return `Tudo bem, sem problema! Se mudar de ideia ou quiser ver outro veículo, é só chamar.`;
   }
 
   // Detecta se pedimos WhatsApp e o cliente ainda não deu
@@ -315,21 +314,35 @@ async function responderFallback(veiculo, historico, mensagem) {
 
   const temTroca  = /\b(troca|trocar)\b/i.test(clienteTextos);
   const temFinanc = /\bfinanc/i.test(clienteTextos);
+  const querOutros = /\b(outros?|tem (mais|outros?)|ver (mais|outros?)|outro (carro|moto|veículo)|mais (carro|moto|opç))\b/i.test(mensagem);
+  const querParcelas = /\b(simul|calcul|quanto fica|parcela|prestação|quanto por mês|quanto sai)\b/i.test(mensagem);
 
   // ── Monta instrução adaptada ao estágio real da conversa ────────────────────
   let instrucao;
   if (nMsgsCliente === 0) {
-    instrucao = `PRIMEIRO CONTATO. Confirme que o veículo está disponível${temTroca ? ', diga que aceita troca' : ''}. Pergunte a cidade do cliente. Máximo 2 frases curtas. Não peça WhatsApp ainda.`;
+    // ETAPA 1: Primeiro contato — confirmar disponibilidade, engajar brevemente. SEM pedir WhatsApp.
+    instrucao = `PRIMEIRO CONTATO. Confirme que o veículo está disponível${temTroca ? ' e que aceita troca' : ''}. Apresente o veículo de forma breve e convidativa. Máximo 2 frases curtas. NÃO peça WhatsApp ainda. NÃO peça a cidade.`;
   } else if (temWppCliente) {
-    instrucao = `O cliente já passou o WhatsApp dele (${telCliente}). Confirme que vai chamar por lá e encerre a conversa do Marketplace de forma simpática. 1 frase apenas. NÃO peça mais nada.`;
+    // WhatsApp capturado — confirmar e encerrar
+    instrucao = `O cliente já passou o WhatsApp (${telCliente}). Confirme que o especialista vai chamar por lá e encerre de forma simpática. 1 frase apenas. NÃO peça mais nada.`;
+  } else if (querParcelas) {
+    // Quer saber de parcelas — confirmar financiamento e conduzir para WhatsApp
+    instrucao = `Cliente quer saber de parcelas/simulação. Diga que a aprovação é facilitada inclusive para negativados. Conduza para o WhatsApp do cliente: "Me passa seu WhatsApp que o especialista te chama e passa certinho as condições." Máximo 2 frases. NÃO mencione links ou nosso telefone.`;
+  } else if (querOutros) {
+    // Quer ver outros veículos — conduzir para WhatsApp
+    instrucao = `Cliente quer ver outros veículos. Diga que temos outras opções. Conduza para o WhatsApp do cliente: "Me passa seu WhatsApp que o pessoal te chama e mostra o que temos disponível." Máximo 2 frases. NÃO mencione links ou nosso telefone.`;
   } else if (clienteNaoDeuNumero) {
-    instrucao = `Cliente não mandou o número quando pedimos. Insiste de forma natural pedindo o WhatsApp dele. 1 frase.`;
-  } else if (!temForma) {
-    instrucao = `ATENÇÃO: leia a mensagem atual antes de responder — se o cliente JÁ respondeu como vai comprar, não pergunte de novo. Se ainda não respondeu, pergunte de forma natural: financiado, à vista ou tem troca? 1 pergunta apenas.`;
+    // Já pedimos WhatsApp, não deu — insistir levemente, sem pressão
+    instrucao = `Já pedimos o WhatsApp e o cliente não passou. Reforce de forma natural e leve, sem pressão. 1 frase. NÃO mencione links ou nosso telefone.`;
+  } else if (nMsgsCliente === 1 && !temForma) {
+    // ETAPA 2: Segunda interação — responder a dúvida e mencionar pontos comerciais. Ainda sem pedir WPP.
+    instrucao = `Responda a dúvida do cliente sobre o veículo.${v.aceitaTroca ? ' Mencione que aceita troca mediante avaliação.' : ''} Mencione que fazemos financiamento facilitado inclusive para negativados. Máximo 2 frases. NÃO peça WhatsApp ainda. NÃO mencione links ou nosso telefone.`;
   } else {
-    instrucao = `O cliente já disse como vai comprar. ${
-      temFinanc ? `Diga que a aprovação é facilitada inclusive para negativados e que ele pode simular direto em ${LINK_VEICULO}. SEM mencionar parcelas ou prestações. ` : ''
-    }${temTroca ? 'Confirme que aceita troca. ' : ''}Passe o link do WhatsApp da loja E peça o WhatsApp do cliente. Ex: "Chama a gente aqui: ${LINK_WPP} — qual o seu número para eu te chamar lá?" Máximo 2 frases. NUNCA mencione valores de parcela.`;
+    // ETAPA 3: 2+ interações ou cliente já demonstrou intenção — conduzir para WhatsApp
+    const contextoPagamento = temFinanc
+      ? 'Confirme que fazemos financiamento facilitado, inclusive para negativados. '
+      : temTroca ? 'Confirme que aceita troca mediante avaliação. ' : '';
+    instrucao = `${contextoPagamento}Conduza a conversa para captar o WhatsApp do cliente: "Me passa seu WhatsApp que o especialista te chama e passa certinho as condições." Máximo 2 frases. NÃO mencione links ou nosso telefone.`;
   }
 
   const BOT_VENDEDOR = { facebook1: 'Jhow', facebook2: 'João', facebook3: 'Lucas', facebook4: 'Bruna' }[BOT_ID] || 'João';
@@ -344,28 +357,24 @@ VEÍCULO EM NEGOCIAÇÃO:
 - Mecânica: ${v.estadoMecanico}
 - Estética: ${v.estadoEstetico}
 - Diferenciais: ${v.diferenciais}
-- Aceita troca: ${v.aceitaTroca ? 'sim' : 'não'}
-- Financiamento: ${v.financiamento}
+- Aceita troca: ${v.aceitaTroca ? 'sim, mediante avaliação' : 'não'}
+- Financiamento: aprovação facilitada, inclusive negativados
 ${v.observacoes ? '- Obs: ' + v.observacoes : ''}
 
-LINKS DISPONÍVEIS (use quando fizer sentido):
-- WhatsApp da loja: ${LINK_WPP}  ← SEMPRE use este link, NUNCA o número puro
-- Este veículo na vitrine: ${LINK_VEICULO}  ← use quando cliente quiser ver fotos/detalhes/simular financiamento
-- Vitrine completa: ${LINK_VITRINE}  ← use quando cliente quiser ver outros veículos
-
-OBJETIVO: Pegar WhatsApp do cliente → Engajar → Coletar forma de compra → Converter.
+OBJETIVO: Engajar o cliente → Apresentar o produto → Captar o WhatsApp para o especialista dar continuidade.
 PRIORIDADE MÁXIMA: conseguir o número do cliente. Tudo mais é secundário.
 
 REGRAS ABSOLUTAS:
 - Máximo 2 frases por resposta
 - Nunca fazer mais de 1 pergunta por vez
 - NÃO repita perguntas que o cliente já respondeu — leia o histórico
-- NÃO pergunte forma de compra se o cliente já disse como vai comprar
 - NÃO peça WhatsApp se o cliente já passou o número
 - Não inventar informações do veículo
 - Nunca usar emojis, asteriscos ou markdown
-- SEMPRE use o link ${LINK_WPP} em vez do número puro quando mencionar WhatsApp da loja
-- PROIBIDO mencionar valor de parcela, prestação ou simulação numérica de financiamento
+- PROIBIDO mencionar qualquer link, URL ou endereço de site
+- PROIBIDO mencionar nosso número de telefone — APENAS peça o número DO CLIENTE
+- PROIBIDO mencionar valor de parcela, prestação ou simulação numérica
+- PROIBIDO escrever mensagens de status como "Aguardando...", "Verificando...", "Processando..." — escreva APENAS a mensagem direta ao cliente
 
 INSTRUÇÃO PARA ESTA MENSAGEM: ${instrucao}`;
 
@@ -378,15 +387,20 @@ INSTRUÇÃO PARA ESTA MENSAGEM: ${instrucao}`;
     system,
     messages: msgs
   });
-  let resposta = res.content[0].text.trim().replace(/\*\*/g, '').replace(/\*/g, '').replace(/[🏍🚗🚙🏎🤝👍👋🔥💪✅📱🙌]/gu, '').trim();
+  let resposta = res.content[0].text.trim()
+    .replace(/\*\*/g, '').replace(/\*/g, '')
+    .replace(/[🏍🚗🚙🏎🤝👍👋🔥💪✅📱🙌]/gu, '')
+    .trim();
 
-  // Garante link wa.me se o Claude colocou número puro
-  resposta = resposta.replace(/\(49\)\s*998[.\s-]?351[.\s-]?418/g, LINK_WPP);
-  resposta = resposta.replace(/49\s*998351418/g, LINK_WPP);
+  // Filtro de segurança: remove qualquer URL que tenha escapado
+  resposta = resposta.replace(/https?:\/\/\S+/gi, '').replace(/\s{2,}/g, ' ').trim();
+  // Filtro de segurança: remove número de telefone da loja que possa ter escapado
+  resposta = resposta.replace(/\(49\)\s*9\d[\d\s.\-]{6,}/g, '').replace(/\b49\s*9\d{8,9}\b/g, '').replace(/\s{2,}/g, ' ').trim();
 
-  // Garante que link está na resposta quando estágio é pedir WhatsApp
-  if (!temWppCliente && temForma && !/api\.whatsapp\.com/.test(resposta)) {
-    resposta += ` ${LINK_WPP}`;
+  // Filtro de segurança: descarta mensagens de status geradas por engano pelo Claude
+  if (/^aguardando\s+(o\s+)?whatsapp|^aguardando\s+resposta|^verificando|^processando/i.test(resposta)) {
+    log.warn(`[bot] Resposta de status detectada e descartada: "${resposta.substring(0, 80)}"`);
+    return null;
   }
 
   return resposta;
@@ -398,7 +412,7 @@ async function responder(veiculo, historico, mensagem) {
 
 function responderForaDeEstoque(vehicleHint) {
   const mencionado = vehicleHint ? vehicleHint.trim() : 'esse veículo';
-  return `Infelizmente o ${mencionado} não está mais disponível. Temos outros veículos, dá uma olhada: https://crmmotoride.lovable.app/vitrine — me passa seu WhatsApp que te ajudo a escolher: https://api.whatsapp.com/send?phone=5549998351418`;
+  return `Infelizmente o ${mencionado} não está mais disponível no momento. Me passa seu WhatsApp que verificamos o que temos disponível e pode te atender.`;
 }
 
 // ── Verifica se deve enviar follow-up (cliente sumiu após nossa resposta) ──────
@@ -426,7 +440,6 @@ async function gerarFollowUp(veiculo, historico) {
     .map(m => `${m.de === 'eu' ? 'João' : 'Cliente'}: ${m.texto}`)
     .join('\n');
 
-  const LINK_WPP_FU = 'https://api.whatsapp.com/send?phone=5549998351418';
   const vendedor = { facebook1: 'Jhow', facebook2: 'João', facebook3: 'Lucas', facebook4: 'Bruna' }[BOT_ID] || 'João';
   const res = await claude.messages.create({
     model: 'claude-haiku-4-5-20251001',
@@ -435,7 +448,7 @@ async function gerarFollowUp(veiculo, historico) {
       role: 'user',
       content: `Você é ${vendedor}, vendedor da MotoRide. Veículo: ${v.marca} ${v.modeloMkt || v.modelo} ${v.ano}, R$${Number(v.preco).toLocaleString('pt-BR')}.
 
-O cliente sumiu. Escreva 1 frase curta e natural de follow-up, sem emoji, sem pressão. Se mencionar contato, use SOMENTE o link ${LINK_WPP_FU} — nunca o número puro. Português informal.
+O cliente sumiu. Escreva 1 frase curta e natural de follow-up, sem emoji, sem pressão. Se mencionar contato, APENAS peça o WhatsApp do cliente — NUNCA mencione nosso número de telefone nem links. Português informal.
 
 Conversa:
 ${conversa}
@@ -443,9 +456,17 @@ ${conversa}
 Follow-up (1 frase apenas):`
     }]
   });
-  let followUpText = res.content[0].text.trim().replace(/\*\*/g, '').replace(/\*/g, '').replace(/[🏍🚗🚙🏎🤝👍👋🔥💪✅📱]/gu, '').trim();
-  // Garante que número puro não escape
-  followUpText = followUpText.replace(/\(49\)\s*998[.\s-]?351[.\s-]?418/g, LINK_WPP_FU).replace(/49\s*998351418/g, LINK_WPP_FU);
+  let followUpText = res.content[0].text.trim()
+    .replace(/\*\*/g, '').replace(/\*/g, '')
+    .replace(/[🏍🚗🚙🏎🤝👍👋🔥💪✅📱]/gu, '')
+    .trim();
+  // Filtro de segurança: remove links e telefone da loja que possam ter escapado
+  followUpText = followUpText
+    .replace(/https?:\/\/\S+/gi, '')
+    .replace(/\(49\)\s*9\d[\d\s.\-]{6,}/g, '')
+    .replace(/\b49\s*9\d{8,9}\b/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
   return followUpText;
 }
 
@@ -814,10 +835,11 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
     if (foraDeEstoque) {
       const telNaMsg = extrairWhatsApp(ultima);
       resp = telNaMsg
-        ? `Obrigado pelo contato! Vou te chamar no ${telNaMsg} pelo WhatsApp pra ver o que temos disponível que pode te atender. https://api.whatsapp.com/send?phone=5549998351418`
+        ? `Obrigado pelo contato! O especialista vai te chamar no ${telNaMsg} para ver o que temos disponível que pode te atender.`
         : responderForaDeEstoque(vehicleHint);
     } else {
       resp = await responder(veiculo, contexto, ultima);
+      if (!resp) return; // resposta descartada pelo filtro de segurança
     }
     log.info(`  Resposta: "${resp}"`);
     await delayAleatorio();

@@ -27,15 +27,16 @@ ${v.observacoes ? `- Obs: ${v.observacoes}` : ''}
 
 REGRAS:
 - Responda como vendedor humano, direto e natural
-- Máximo 3 linhas por resposta
+- Máximo 2 frases por resposta
 - NUNCA invente dados que não estão na ficha acima
 - Se não souber algo, diga "deixa eu verificar pra você"
-- Sempre tente avançar: visita, WhatsApp, proposta
-- WhatsApp para fechar: (49) 99951-5791
+- Objetivo: captar o WhatsApp do cliente para o especialista dar continuidade
+- PROIBIDO mencionar qualquer link, URL ou endereço de site
+- PROIBIDO mencionar nosso número de telefone — APENAS peça o número DO CLIENTE
 - Sem bullet points, texto corrido
 - Linguagem brasileira informal
 - Financiamento: aprovação facilitada, inclusive negativados
-- PROIBIDO mencionar valores de parcela, prestação ou simulação — não temos tabela de financiamento. Diga só que a aprovação é facilitada e que os detalhes são no WhatsApp`;
+- PROIBIDO mencionar valores de parcela, prestação ou simulação numérica`;
 }
 
 async function gerar(vehicle, historico, mensagem) {
