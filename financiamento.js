@@ -18,7 +18,7 @@ const AQUI_CIDADE       = process.env.AQUI_CIDADE   || 'Curitibanos-SC';
 const AQUI_DDD_TEL      = process.env.AQUI_DDD_TEL  || '49';
 const AQUI_TEL          = process.env.AQUI_TEL      || '999515791';
 const AQUI_NOME_CONTATO = process.env.AQUI_NOME_CONTATO || 'MotoRide Curitibanos';
-const AQUI_EMAIL        = process.env.AQUI_EMAIL    || 'motoridesc@gmail.com';
+const AQUI_EMAIL        = process.env.AQUI_EMAIL    || 'motoridecs@gmail.com';
 
 const AQUI_URL_LOGIN    = 'https://www.aquifinanciamentos.com.br/loja/loginLoja.php';
 
@@ -112,189 +112,230 @@ const PARCELAS_ID = { '6':1,'12':2,'15':10,'18':4,'24':3,'30':5,'36':6,'40':7,'4
 // Coeficientes: nome → id interno do select
 const COEF_ID = { 'A':2,'B':3,'C':4,'D':5,'Unico':6 };
 
-// ── Preenchimento do formulário ───────────────────────────────────────────────
-
-async function preencherCampo(page, seletor, valor) {
-  if (!valor && valor !== 0) return;
-  try {
-    await page.fill(seletor, String(valor));
-  } catch {
-    // campo inexistente ou oculto — ignora silenciosamente
-  }
-}
-
-async function selecionarOpcao(page, seletor, valor) {
-  if (!valor) return;
-  try {
-    await page.selectOption(seletor, { value: String(valor) });
-  } catch {
-    try { await page.selectOption(seletor, { label: String(valor) }); } catch {}
-  }
-}
+// ── Envio da ficha ────────────────────────────────────────────────────────────
 
 async function enviarFicha(ficha) {
   log.info(`[financiamento] Iniciando envio ficha ${ficha.id} — ${ficha.nome}`);
 
-  const browser = await chromium.launch({ headless: true });
+  // Chrome estável: sem sandbox (necessário em ambientes Windows/server), sem GPU
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-software-rasterizer'],
+  });
   const context = await browser.newContext();
   const page    = await context.newPage();
 
   try {
     // ── 1. Login ─────────────────────────────────────────────────────────────
-    await page.goto(AQUI_URL_LOGIN, { waitUntil: 'domcontentloaded' });
-    await page.fill('input[name="login"], input[type="text"]:first-of-type', AQUI_LOGIN);
-    await page.fill('input[name="senha"], input[type="password"]', AQUI_SENHA);
-    await page.click('input[type="submit"], button');
-    await page.waitForURL('**/novaFichaCadastral.php', { timeout: 15000 });
+    await page.goto(AQUI_URL_LOGIN, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.fill('input[name="login"]', AQUI_LOGIN);
+    await page.fill('input[name="senha"]', AQUI_SENHA);
+    await page.click('input[type="submit"], button[type="submit"]');
+    await page.waitForURL('**/novaFichaCadastral.php', { timeout: 20000 });
     log.ok('[financiamento] Login realizado');
 
-    // ── 2. Simulação / Método de Financiamento ────────────────────────────────
-    const idTabela = idTabelaFinanciamento(ficha.tabela_fin);
-    await selecionarOpcao(page, '#idTabela', idTabela);
-    await selecionarOpcao(page, '#anoItem',  String(ficha.veiculo_ano || '2013'));
+    // Aguarda a página carregar completamente antes de preencher
+    await page.waitForLoadState('domcontentloaded');
+    await page.waitForTimeout(1500);
 
-    // Habilita os campos de simulação (que começam desabilitados)
-    await page.evaluate(() => {
-      ['valor','coeficiente','parcelas','parcela'].forEach(id => {
+    // ── 2. Preenche TODOS os campos via evaluate (sem page.fill — evita Target crashed) ──
+    // Usar page.fill em campos disabled/dinâmicos causa crash do Chrome.
+    // evaluate roda no contexto do browser e define os valores diretamente no DOM
+    // sem disparar os event listeners JavaScript do site que causam instabilidade.
+
+    const dados = {
+      idTabela:  idTabelaFinanciamento(ficha.tabela_fin),
+      anoItem:   String(ficha.veiculo_ano || '2013'),
+      valor:     ficha.valor_financiado ? Number(ficha.valor_financiado).toFixed(2).replace('.', ',') : '',
+      coef:      ficha.coeficiente      ? String(COEF_ID[ficha.coeficiente] || 2) : '',
+      parcelas:  ficha.num_parcelas     ? String(PARCELAS_ID[String(ficha.num_parcelas)] || 3) : '',
+      parcela:   ficha.valor_parcela    ? Number(ficha.valor_parcela).toFixed(2) : '',
+      // Pessoais
+      nome:         ficha.nome         || '',
+      nascimento:   ficha.nascimento   || '',
+      mae:          ficha.mae          || '',
+      cpf:          ficha.cpf          || '',
+      dddcelular:   ficha.ddd_celular  || '',
+      celular:      ficha.celular      || '',
+      cep:          ficha.cep          || '',
+      endereco:     ficha.endereco     || '',
+      num:          ficha.num_end      || '',
+      bairro:       ficha.bairro       || '',
+      cidade:       ficha.cidade       || '',
+      ufend:        ficha.uf           || '',
+      moradia:      ficha.moradia      || '',
+      anores:       ficha.anos_residencia || '',
+      // Profissionais
+      empresa:      ficha.empresa      || '',
+      tempoemprego: ficha.tempo_emprego || '',
+      cepemp:       ficha.cep_emp      || '',
+      enderecoemp:  ficha.endereco_emp || '',
+      numemp:       ficha.num_emp      || '',
+      bairroemp:    ficha.bairro_emp   || '',
+      cidadeemp:    ficha.cidade_emp   || '',
+      ufemp:        ficha.uf_emp       || '',
+      dddtelemp:    ficha.ddd_tel_emp  || '',
+      telemp:       ficha.tel_emp      || '',
+      funcao:       ficha.funcao       || '',
+      rendab:       ficha.renda_bruta  || '',
+      // Referências
+      ref1:         ficha.ref1_nome    || '',
+      dddtelref1:   ficha.ref1_ddd     || '',
+      telref1:      ficha.ref1_tel     || '',
+      ref2:         ficha.ref2_nome    || '',
+      dddtelref2:   ficha.ref2_ddd     || '',
+      telref2:      ficha.ref2_tel     || '',
+      // Garantia
+      marca:        ficha.veiculo_marca  || '',
+      modelo:       ficha.veiculo_modelo || '',
+      fabricacao:   String(ficha.veiculo_ano || ''),
+      amodelo:      String(ficha.veiculo_ano || ''),
+      placa:        ficha.veiculo_placa  || '',
+      // Loja (fixo)
+      dddtelcontato: AQUI_DDD_TEL,
+      telcontato:    AQUI_TEL,
+      nomecontato:   AQUI_NOME_CONTATO,
+      lojacontato:   AQUI_LOJA,
+      cidadecontato: AQUI_CIDADE,
+      emailcontato:  AQUI_EMAIL,
+    };
+
+    await page.evaluate((d) => {
+      // Seta valor de input por ID (habilita o campo se estiver disabled)
+      function setVal(id, val) {
+        if (val == null || val === '') return;
         const el = document.getElementById(id);
-        if (el) { el.disabled = false; el.classList.remove('disabled'); }
+        if (!el) return;
+        el.disabled = false;
+        el.readOnly = false;
+        el.value = String(val);
+      }
+
+      // Seta select por ID usando value ou label
+      function setSelect(id, val) {
+        if (val == null || val === '') return;
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.disabled = false;
+        const opts = Array.from(el.options);
+        const byVal   = opts.find(o => o.value === String(val));
+        const byLabel = opts.find(o => o.text.trim() === String(val));
+        if (byVal)   { el.value = byVal.value;   return; }
+        if (byLabel) { el.value = byLabel.value;  return; }
+      }
+
+      // ── Simulação ───────────────────────────────────────────────────────────
+      setSelect('idTabela',    d.idTabela);
+      setSelect('anoItem',     d.anoItem);
+      setVal('valor',          d.valor);
+      setSelect('coeficiente', d.coef);
+      setSelect('parcelas',    d.parcelas);
+      setVal('parcela',        d.parcela);
+
+      // ── Dados Pessoais ──────────────────────────────────────────────────────
+      setVal('nome',        d.nome);
+      setVal('nascimento',  d.nascimento);
+      setVal('mae',         d.mae);
+      setVal('cpf',         d.cpf);
+      setVal('dddcelular',  d.dddcelular);
+      setVal('celular',     d.celular);
+      setVal('cep',         d.cep);
+      setVal('endereco',    d.endereco);
+      setVal('num',         d.num);
+
+      // Bairro residencial: input[name="bairro"] que não seja do empregador
+      const bairroInputs = document.querySelectorAll('input[name="bairro"]');
+      bairroInputs.forEach(el => {
+        if (!el.id || !el.id.toLowerCase().includes('emp')) {
+          el.disabled = false;
+          el.value = d.bairro;
+        }
       });
-    });
 
-    if (ficha.valor_financiado) {
-      const valorFormatado = Number(ficha.valor_financiado).toFixed(2).replace('.', ',');
-      await page.fill('#valor', valorFormatado);
-    }
-    if (ficha.coeficiente) {
-      await selecionarOpcao(page, '#coeficiente', String(COEF_ID[ficha.coeficiente] || 2));
-    }
-    if (ficha.num_parcelas) {
-      await selecionarOpcao(page, '#parcelas', String(PARCELAS_ID[String(ficha.num_parcelas)] || 3));
-    }
-    if (ficha.valor_parcela) {
-      await page.evaluate((val) => {
-        const el = document.getElementById('parcela');
-        if (el) { el.disabled = false; el.classList.remove('disabled'); el.value = val; }
-      }, Number(ficha.valor_parcela).toFixed(2));
-    }
+      setVal('cidade',      d.cidade);
+      setVal('ufend',       d.ufend);
+      setSelect('moradia',  d.moradia);
+      setVal('anores',      d.anores);
 
-    log.ok('[financiamento] Simulação preenchida');
-
-    // ── 3. Dados Pessoais ─────────────────────────────────────────────────────
-    await preencherCampo(page, '#nome',       ficha.nome);
-    await preencherCampo(page, '#nascimento', ficha.nascimento);
-    await preencherCampo(page, '#mae',        ficha.mae);
-    await preencherCampo(page, '#cpf',        ficha.cpf);
-    await preencherCampo(page, '#dddcelular', ficha.ddd_celular);
-    await preencherCampo(page, '#celular',    ficha.celular);
-    await preencherCampo(page, '#cep',        ficha.cep);
-    await preencherCampo(page, '#endereco',   ficha.endereco);
-    await preencherCampo(page, '#num',        ficha.num_end);
-    await preencherCampo(page, 'input[name="bairro"]:not([id*="emp"])', ficha.bairro);
-    await preencherCampo(page, '#cidade',     ficha.cidade);
-    await preencherCampo(page, '#ufend',      ficha.uf);
-
-    if (ficha.moradia) {
-      await selecionarOpcao(page, '#moradia', ficha.moradia === 'Própria' ? 'Própria' : 'Alugada');
-    }
-    if (ficha.anos_residencia) {
-      await preencherCampo(page, '#anores', ficha.anos_residencia);
-    }
-
-    // Sexo padrão M
-    await page.evaluate(() => {
+      // Sexo padrão M
       const radios = document.querySelectorAll('input[name="sexo"]');
       if (radios.length > 0) radios[0].checked = true;
-    });
 
-    log.ok('[financiamento] Dados pessoais preenchidos');
+      // ── Dados Profissionais ─────────────────────────────────────────────────
+      setVal('empresa',      d.empresa);
+      setVal('tempoemprego', d.tempoemprego);
+      setVal('cepemp',       d.cepemp);
+      setVal('enderecoemp',  d.enderecoemp);
+      setVal('numemp',       d.numemp);
+      setVal('bairroemp',    d.bairroemp);
+      setVal('cidadeemp',    d.cidadeemp);
+      setVal('ufemp',        d.ufemp);
+      setVal('dddtelemp',    d.dddtelemp);
+      setVal('telemp',       d.telemp);
+      setVal('funcao',       d.funcao);
+      setVal('rendab',       d.rendab);
 
-    // ── 4. Dados Profissionais ────────────────────────────────────────────────
-    await preencherCampo(page, '#empresa',     ficha.empresa);
-    await preencherCampo(page, '#tempoemprego', ficha.tempo_emprego);
-    await preencherCampo(page, '#cepemp',      ficha.cep_emp);
-    await preencherCampo(page, '#enderecoemp', ficha.endereco_emp);
-    await preencherCampo(page, '#numemp',      ficha.num_emp);
-    await preencherCampo(page, '#bairroemp',   ficha.bairro_emp);
-    await preencherCampo(page, '#cidadeemp',   ficha.cidade_emp);
-    await preencherCampo(page, '#ufemp',       ficha.uf_emp);
-    await preencherCampo(page, '#dddtelemp',   ficha.ddd_tel_emp);
-    await preencherCampo(page, '#telemp',      ficha.tel_emp);
-    await preencherCampo(page, '#funcao',      ficha.funcao);
-    await preencherCampo(page, '#rendab',      ficha.renda_bruta);
+      // ── Referências ─────────────────────────────────────────────────────────
+      setVal('ref1',       d.ref1);
+      setVal('dddtelref1', d.dddtelref1);
+      setVal('telref1',    d.telref1);
+      setVal('ref2',       d.ref2);
+      setVal('dddtelref2', d.dddtelref2);
+      setVal('telref2',    d.telref2);
 
-    log.ok('[financiamento] Dados profissionais preenchidos');
+      // ── Dados da Garantia ───────────────────────────────────────────────────
+      setVal('marca',      d.marca);
+      setVal('modelo',     d.modelo);
+      setVal('fabricacao', d.fabricacao);
+      setVal('amodelo',    d.amodelo);
+      setVal('placa',      d.placa);
 
-    // ── 5. Referências ────────────────────────────────────────────────────────
-    if (ficha.ref1_nome) {
-      await preencherCampo(page, '#ref1',       ficha.ref1_nome);
-      await preencherCampo(page, '#dddtelref1', ficha.ref1_ddd);
-      await preencherCampo(page, '#telref1',    ficha.ref1_tel);
-    }
-    if (ficha.ref2_nome) {
-      await preencherCampo(page, '#ref2',       ficha.ref2_nome);
-      await preencherCampo(page, '#dddtelref2', ficha.ref2_ddd);
-      await preencherCampo(page, '#telref2',    ficha.ref2_tel);
-    }
-
-    log.ok('[financiamento] Referências preenchidas');
-
-    // ── 6. Dados da Garantia (Moto — preenchidos pelo sistema) ───────────────
-    await preencherCampo(page, '#marca',     ficha.veiculo_marca);
-    await preencherCampo(page, '#modelo',    ficha.veiculo_modelo);
-    await preencherCampo(page, '#fabricacao', ficha.veiculo_ano);
-    await preencherCampo(page, '#amodelo',   ficha.veiculo_ano);
-    await preencherCampo(page, '#placa',     ficha.veiculo_placa);
-
-    // Tipo: Moto
-    await page.evaluate(() => {
+      // Tipo: Moto
       document.querySelectorAll('input[name="tipo"]').forEach(r => {
         if (r.value === 'Moto') r.checked = true;
       });
-    });
-    // Condição: Usado
-    await page.evaluate(() => {
+      // Condição: Usado
       document.querySelectorAll('input[name="condicao"]').forEach(r => {
         if (r.id !== 'condNovo') r.checked = true;
       });
-    });
 
-    log.ok('[financiamento] Dados da garantia preenchidos');
+      // ── Informações da Loja ─────────────────────────────────────────────────
+      setVal('dddtelcontato', d.dddtelcontato);
+      setVal('telcontato',    d.telcontato);
+      setVal('nomecontato',   d.nomecontato);
+      setVal('lojacontato',   d.lojacontato);
+      setVal('cidadecontato', d.cidadecontato);
+      setVal('emailcontato',  d.emailcontato);
+    }, dados);
 
-    // ── 7. Informações Finais (dados da loja — sempre fixos) ─────────────────
-    await preencherCampo(page, '#dddtelcontato', AQUI_DDD_TEL);
-    await preencherCampo(page, '#telcontato',    AQUI_TEL);
-    await preencherCampo(page, '#nomecontato',   AQUI_NOME_CONTATO);
-    await preencherCampo(page, '#lojacontato',   AQUI_LOJA);
-    await preencherCampo(page, '#cidadecontato', AQUI_CIDADE);
-    await preencherCampo(page, '#emailcontato',  AQUI_EMAIL);
+    log.ok('[financiamento] Formulário preenchido');
 
-    log.ok('[financiamento] Informações da loja preenchidas');
-
-    // ── 8. Screenshot antes de enviar ────────────────────────────────────────
+    // ── 3. Screenshot antes de enviar ────────────────────────────────────────
     await page.screenshot({
       path: path.join(__dirname, 'logs', `ficha-${ficha.id}-antes.png`),
       fullPage: true,
     });
 
-    // ── 9. Enviar ─────────────────────────────────────────────────────────────
+    // ── 4. Enviar ─────────────────────────────────────────────────────────────
     await page.evaluate(() => {
-      // Clica no botão "Validar e Enviar" pelo texto ou pelo tipo
       const btns = Array.from(document.querySelectorAll('input[type="button"], input[type="submit"], button'));
-      const enviar = btns.find(b => b.value?.includes('Enviar') || b.textContent?.includes('Enviar'));
+      const enviar = btns.find(b =>
+        (b.value && b.value.toLowerCase().includes('enviar')) ||
+        (b.textContent && b.textContent.toLowerCase().includes('enviar'))
+      );
       if (enviar) enviar.click();
     });
 
-    await page.waitForTimeout(4000);
+    await page.waitForTimeout(5000);
 
     await page.screenshot({
       path: path.join(__dirname, 'logs', `ficha-${ficha.id}-depois.png`),
       fullPage: true,
     });
 
-    const urlAtual  = page.url();
-    const conteudo  = (await page.content()).toLowerCase();
-    const temErro   = conteudo.includes('erro') || urlAtual.includes('loginLoja');
+    const urlAtual   = page.url();
+    const conteudo   = (await page.content()).toLowerCase();
+    const temErro    = conteudo.includes('erro') || urlAtual.includes('loginLoja');
     const temSucesso = conteudo.includes('sucesso') || conteudo.includes('enviado') || conteudo.includes('obrigado');
 
     if (temErro && !temSucesso) {
@@ -311,8 +352,25 @@ async function enviarFicha(ficha) {
 
 // ── Daemon principal ──────────────────────────────────────────────────────────
 
+// Reseta fichas presas em 'processando' (crash anterior sem marcarErro)
+async function resetarFichasTravas() {
+  const rows = await supabaseGet('financiamento_fichas?status=eq.processando');
+  if (Array.isArray(rows) && rows.length > 0) {
+    for (const r of rows) {
+      await supabasePatch(`financiamento_fichas?id=eq.${r.id}`, {
+        status: 'pendente',
+        erro_msg: null,
+      });
+      log.warn(`[financiamento] Ficha travada ${r.id} (${r.nome}) → resetada para pendente`);
+    }
+  }
+}
+
 async function daemon() {
   log.info('[financiamento] Daemon iniciado. Aguardando fichas pendentes a cada 30s...');
+
+  // Limpa fichas que ficaram em 'processando' por crash anterior
+  await resetarFichasTravas();
 
   while (true) {
     try {
@@ -320,14 +378,18 @@ async function daemon() {
 
       if (ficha) {
         log.info(`[financiamento] Ficha encontrada: ${ficha.id} — ${ficha.nome}`);
-        await marcarProcessando(ficha.id);
+        const marcou = await marcarProcessando(ficha.id);
 
-        try {
-          await enviarFicha(ficha);
-          await marcarEnviado(ficha.id);
-        } catch (err) {
-          log.error(`[financiamento] Erro ao enviar ficha ${ficha.id}: ${err.message}`);
-          await marcarErro(ficha.id, err.message);
+        if (!marcou) {
+          log.warn(`[financiamento] Falha ao marcar processando ${ficha.id} — pulando ciclo`);
+        } else {
+          try {
+            await enviarFicha(ficha);
+            await marcarEnviado(ficha.id);
+          } catch (err) {
+            log.error(`[financiamento] Erro ao enviar ficha ${ficha.id}: ${err.message}`);
+            await marcarErro(ficha.id, err.message);
+          }
         }
       }
     } catch (err) {
