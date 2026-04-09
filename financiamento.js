@@ -172,7 +172,10 @@ async function enviarFicha(ficha) {
       await selecionarOpcao(page, '#parcelas', String(PARCELAS_ID[String(ficha.num_parcelas)] || 3));
     }
     if (ficha.valor_parcela) {
-      await page.fill('#parcela', Number(ficha.valor_parcela).toFixed(2));
+      await page.evaluate((val) => {
+        const el = document.getElementById('parcela');
+        if (el) { el.disabled = false; el.classList.remove('disabled'); el.value = val; }
+      }, Number(ficha.valor_parcela).toFixed(2));
     }
 
     log.ok('[financiamento] Simulação preenchida');
