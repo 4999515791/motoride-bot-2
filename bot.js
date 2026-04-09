@@ -37,15 +37,21 @@ async function chamarEdgeFunction(nome, body) {
   return new Promise((resolve) => {
     const data = JSON.stringify(body);
     const url  = new URL(`${SUPABASE_URL}/functions/v1/${nome}`);
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-bot-token': BOT_SECRET_TOKEN,
+      'Content-Length': Buffer.byteLength(data),
+    };
+    // Inclui headers de autenticação Supabase para funcionar mesmo com JWT ativado
+    if (SUPABASE_ANON_KEY) {
+      headers['apikey']        = SUPABASE_ANON_KEY;
+      headers['Authorization'] = `Bearer ${SUPABASE_ANON_KEY}`;
+    }
     const options = {
       hostname: url.hostname,
       path: url.pathname,
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-bot-token': BOT_SECRET_TOKEN,
-        'Content-Length': Buffer.byteLength(data),
-      },
+      headers,
     };
     const req = https.request(options, (res) => {
       let raw = '';
@@ -79,6 +85,40 @@ function notificarTelegram(mensagem) {
   req.on('error', (e) => log.warn(`[Telegram] Falha ao notificar: ${e.message}`));
   req.write(data);
   req.end();
+}
+
+// ── Supabase REST API — POST/UPSERT ─────────────────────
+async function supabaseRestPost(tabela, body, upsertColuna) {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return null;
+  return new Promise((resolve) => {
+    const data = JSON.stringify(body);
+    const qs   = upsertColuna ? `?on_conflict=${upsertColuna}` : '';
+    const url  = new URL(`${SUPABASE_URL}/rest/v1/${tabela}${qs}`);
+    const req  = https.request({
+      hostname: url.hostname,
+      path:     url.pathname + url.search,
+      method:   'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'apikey':        SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        'Prefer':        'return=representation,resolution=merge-duplicates',
+        'Content-Length': Buffer.byteLength(data),
+      },
+    }, (res) => {
+      let raw = '';
+      res.on('data', chunk => raw += chunk);
+      res.on('end', () => {
+        if (res.statusCode >= 400) {
+          log.warn(`[REST POST] ${tabela} — HTTP ${res.statusCode} | ${raw.slice(0, 200)}`);
+        }
+        try { resolve(JSON.parse(raw)); } catch { resolve(null); }
+      });
+    });
+    req.on('error', (e) => { log.warn(`[REST POST] ${tabela} — erro: ${e.message}`); resolve(null); });
+    req.write(data);
+    req.end();
+  });
 }
 
 // ── Supabase REST API — veículos ─────────────────────────
@@ -214,38 +254,43 @@ function classificarLead(historico, telefone) {
   return 'Interesse inicial';
 }
 
-// ── Cria lead no CRM via Edge Function (bot-create-lead) ─────────────────────
+// ── Cria/atualiza lead no CRM via REST direto na tabela leads ────────────────
 async function sincronizarLeadCRM(convId, compradorNome, veiculo, historico, telefone) {
-  if (!SUPABASE_URL || !BOT_SECRET_TOKEN) return;
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return;
 
   const nomeReal      = compradorNome.replace(/_/g, ' ').replace(/\d+/g, '').trim() || 'Lead Marketplace';
   const interesse     = veiculo ? `Comprar ${veiculo.marca} ${veiculo.modelo} ${veiculo.ano}` : 'comprar moto';
   const classificacao = classificarLead(historico, telefone);
+  const sellerNome    = { facebook1: 'Jhow', facebook2: 'João', facebook3: 'Lucas', facebook4: 'Bruna' }[BOT_ID] || BOT_ID;
   const notas         = historico
-    ? `[Facebook Marketplace] Classificação: ${classificacao}\n` + historico.slice(-10).map(m => `${m.de === 'eu' ? 'Vendedor' : 'Cliente'}: ${m.texto}`).join('\n')
+    ? `[Marketplace ${sellerNome}] Classificação: ${classificacao}\n` + historico.slice(-10).map(m => `${m.de === 'eu' ? 'Vendedor' : 'Cliente'}: ${m.texto}`).join('\n')
     : null;
 
-  const result = await chamarEdgeFunction('bot-create-lead', {
-    name:            nomeReal,
-    phone:           telefone,
-    interest:        interesse,
-    source:          'marketplace-facebook',
-    seller_name:     { facebook1: 'Jhow', facebook2: 'João', facebook3: 'Lucas' }[BOT_ID] || BOT_ID,
-    notes:           notas,
-    conv_id:         convId,
-    bot_id:          BOT_ID,
-    vehicle_label:   veiculo ? `${veiculo.marca} ${veiculo.modelo} ${veiculo.ano}` : null,
-    local_vehicle_id: veiculo?.id || null,
+  const payload = {
+    nome:                nomeReal,
+    telefone:            telefone || null,
+    interesse,
+    source:              'marketplace-facebook',
+    notas,
+    conv_id:             convId,
+    bot_id:              BOT_ID,
+    local_vehicle_id:    veiculo?.id || null,
+    veiculo_desejado_desc: veiculo ? `${veiculo.marca} ${veiculo.modelo} ${veiculo.ano}` : null,
     classificacao,
-  });
+    status:              'novo',
+    ultimo_contato:      new Date().toISOString(),
+  };
 
-  if (!result || result.error) {
-    log.warn(`[CRM] Falha ao criar lead: ${result?.error || 'sem resposta'}`);
+  // Upsert direto na tabela leads — resolve conflito por conv_id
+  const result = await supabaseRestPost('leads', payload, 'conv_id');
+  if (!result || (result.code && result.message)) {
+    log.warn(`[CRM] Falha ao salvar lead: ${result?.message || 'sem resposta'} | ${JSON.stringify(result||{}).slice(0,200)}`);
     return null;
   }
 
-  const clientId = result.id || result.client_id || null;
-  log.ok(`[CRM] Lead criado: ${nomeReal} → ${clientId}`);
+  const row = Array.isArray(result) ? result[0] : result;
+  const clientId = row?.id || null;
+  log.ok(`[CRM] Lead salvo: ${nomeReal} → ${clientId}`);
   return clientId;
 }
 
