@@ -159,7 +159,10 @@ async function carregarVeiculosSupabase() {
 async function lerConfiguracaoCRM() {
   if (!SUPABASE_URL || !BOT_SECRET_TOKEN) return null;
   const result = await chamarEdgeFunction('bot-get-config', { bot_id: BOT_ID, bot_type: 'messaging' });
-  return (result && result.config) ? result.config : null;
+  if (!result) return null;
+  const data = result.config || result;
+  if (!data || !data.bot_id) return null;
+  return { ...data, is_active: data.is_active ?? data.ativo };
 }
 
 // Envia heartbeat ao CRM — CRM sabe que o bot está vivo
@@ -230,7 +233,7 @@ async function sincronizarLeadCRM(convId, compradorNome, veiculo, historico, tel
 
 // ── Arquivos de dados ────────────────────────────────────
 const VEHICLES_FILE = path.join(__dirname, 'data', 'vehicles.json');
-const LEADS_FILE    = path.join(__dirname, 'data', 'leads.json');
+const LEADS_FILE    = path.join(__dirname, 'data', `leads-${BOT_ID}.json`);
 
 function loadJSON(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return {}; }
@@ -267,6 +270,11 @@ async function responderFallback(veiculo, historico, mensagem) {
     return `Vi que você mandou um áudio, mas aqui no chat não consigo ouvir. Pode me contar em texto o que quer saber sobre ${nome}?`;
   }
 
+  // Foto enviada pelo cliente — pede pra mandar no WhatsApp
+  if (mensagem === '[foto]') {
+    return `Vi que você mandou foto, mas aqui no chat às vezes não carrega direito. Manda no WhatsApp (49) 998351418 que eu vejo tudo certinho e já te respondo por lá.`;
+  }
+
   // ── Analisa TODO o contexto disponível, incluindo a mensagem atual ──────────
   // IMPORTANTE: inclui `mensagem` (msg atual do cliente) para não perder informações
   // que chegaram agora (WhatsApp, forma de compra, etc.)
@@ -300,23 +308,33 @@ async function responderFallback(veiculo, historico, mensagem) {
     return `${acao} Me passa seu WhatsApp que eu te ajudo pessoalmente: ${LINK_WPP}`;
   }
 
+  // Detecta se pedimos WhatsApp e o cliente ainda não deu
+  const ultimaNossa = [...hist].reverse().find(m => m.de === 'eu');
+  const pedimosWpp = ultimaNossa && /whatsapp|wpp|zap|número|numero/i.test(ultimaNossa.texto);
+  const clienteNaoDeuNumero = pedimosWpp && !temWppCliente;
+
+  const temTroca  = /\b(troca|trocar)\b/i.test(clienteTextos);
+  const temFinanc = /\bfinanc/i.test(clienteTextos);
+
   // ── Monta instrução adaptada ao estágio real da conversa ────────────────────
   let instrucao;
   if (nMsgsCliente === 0) {
-    instrucao = `PRIMEIRO CONTATO. Confirme que o veículo está disponível e pergunte a cidade do cliente. Máximo 2 frases curtas. Não peça WhatsApp ainda.`;
+    instrucao = `PRIMEIRO CONTATO. Confirme que o veículo está disponível${temTroca ? ', diga que aceita troca' : ''}. Pergunte a cidade do cliente. Máximo 2 frases curtas. Não peça WhatsApp ainda.`;
   } else if (temWppCliente) {
     instrucao = `O cliente já passou o WhatsApp dele (${telCliente}). Confirme que vai chamar por lá e encerre a conversa do Marketplace de forma simpática. 1 frase apenas. NÃO peça mais nada.`;
+  } else if (clienteNaoDeuNumero) {
+    instrucao = `Cliente não mandou o número quando pedimos. Insiste de forma natural pedindo o WhatsApp dele. 1 frase.`;
   } else if (!temForma) {
     instrucao = `ATENÇÃO: leia a mensagem atual antes de responder — se o cliente JÁ respondeu como vai comprar, não pergunte de novo. Se ainda não respondeu, pergunte de forma natural: financiado, à vista ou tem troca? 1 pergunta apenas.`;
   } else {
     instrucao = `O cliente já disse como vai comprar. ${
-      /financ/i.test(clienteTextos)
-        ? `Diga que a aprovação é facilitada inclusive para negativados e que ele pode simular direto em ${LINK_VEICULO}. SEM mencionar parcelas ou prestações. `
-        : ''
-    }Passe o link do WhatsApp da loja E peça o WhatsApp do cliente. Ex: "Chama a gente aqui: ${LINK_WPP} — qual o seu número para eu te chamar lá?" Máximo 2 frases. NUNCA mencione valores de parcela.`;
+      temFinanc ? `Diga que a aprovação é facilitada inclusive para negativados e que ele pode simular direto em ${LINK_VEICULO}. SEM mencionar parcelas ou prestações. ` : ''
+    }${temTroca ? 'Confirme que aceita troca. ' : ''}Passe o link do WhatsApp da loja E peça o WhatsApp do cliente. Ex: "Chama a gente aqui: ${LINK_WPP} — qual o seu número para eu te chamar lá?" Máximo 2 frases. NUNCA mencione valores de parcela.`;
   }
 
-  const system = `Você é João, vendedor da MotoRide em Curitibanos-SC. Tom natural, humano, direto — sem parecer robô, sem emojis, sem asteriscos, sem textos longos.
+  const BOT_VENDEDOR = { facebook1: 'Jhow', facebook2: 'João', facebook3: 'Lucas', facebook4: 'Bruna' }[BOT_ID] || 'João';
+
+  const system = `Você é ${BOT_VENDEDOR}, vendedor da MotoRide em Curitibanos-SC. Tom natural, humano, direto — sem parecer robô, sem emojis, sem asteriscos, sem textos longos.
 
 VEÍCULO EM NEGOCIAÇÃO:
 - ${v.marca} ${v.modeloMkt || v.modelo} ${v.versao || ''} ${v.ano}
@@ -408,14 +426,16 @@ async function gerarFollowUp(veiculo, historico) {
     .map(m => `${m.de === 'eu' ? 'João' : 'Cliente'}: ${m.texto}`)
     .join('\n');
 
+  const LINK_WPP_FU = 'https://api.whatsapp.com/send?phone=5549998351418';
+  const vendedor = { facebook1: 'Jhow', facebook2: 'João', facebook3: 'Lucas', facebook4: 'Bruna' }[BOT_ID] || 'João';
   const res = await claude.messages.create({
     model: 'claude-haiku-4-5-20251001',
     max_tokens: 50,
     messages: [{
       role: 'user',
-      content: `Você é João, vendedor da MotoRide. Veículo: ${v.marca} ${v.modeloMkt || v.modelo} ${v.ano}, R$${Number(v.preco).toLocaleString('pt-BR')}.
+      content: `Você é ${vendedor}, vendedor da MotoRide. Veículo: ${v.marca} ${v.modeloMkt || v.modelo} ${v.ano}, R$${Number(v.preco).toLocaleString('pt-BR')}.
 
-O cliente sumiu. Escreva 1 frase curta e natural de follow-up, sem emoji, sem pressão. Mencione o WhatsApp (49) 998351418 se fizer sentido. Português informal.
+O cliente sumiu. Escreva 1 frase curta e natural de follow-up, sem emoji, sem pressão. Se mencionar contato, use SOMENTE o link ${LINK_WPP_FU} — nunca o número puro. Português informal.
 
 Conversa:
 ${conversa}
@@ -423,7 +443,10 @@ ${conversa}
 Follow-up (1 frase apenas):`
     }]
   });
-  return res.content[0].text.trim().replace(/\*\*/g, '').replace(/\*/g, '').replace(/[🏍🚗🚙🏎🤝👍👋🔥💪✅📱]/gu, '').trim();
+  let followUpText = res.content[0].text.trim().replace(/\*\*/g, '').replace(/\*/g, '').replace(/[🏍🚗🚙🏎🤝👍👋🔥💪✅📱]/gu, '').trim();
+  // Garante que número puro não escape
+  followUpText = followUpText.replace(/\(49\)\s*998[.\s-]?351[.\s-]?418/g, LINK_WPP_FU).replace(/49\s*998351418/g, LINK_WPP_FU);
+  return followUpText;
 }
 
 // ── Lê mensagens recebidas do painel ────────────────────
@@ -852,7 +875,7 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
           const isNovoLead     = !deveAtualizar;
           const chegouTelefone = deveAtualizar && tel && !lead.crmTemTelefone;
           if (isNovoLead || chegouTelefone) {
-            const botNomes = { facebook1: 'Jhow', facebook2: 'João Moto Ride', facebook3: 'Lucas Moto Ride' };
+            const botNomes = { facebook1: 'Jhow', facebook2: 'João Moto Ride', facebook3: 'Lucas Moto Ride', facebook4: 'Bruna Moto Ride' };
             const botNome  = botNomes[BOT_ID] || BOT_ID;
             const veiculoLabel = veiculo ? `${veiculo.marca} ${veiculo.modelo} ${veiculo.ano}` : 'veículo desconhecido';
             const linhasTel = tel ? `📞 <b>WhatsApp:</b> ${tel}` : `📭 Ainda sem telefone`;
@@ -1040,12 +1063,34 @@ async function main() {
   log.info('Veículos: ' + ativos.map(v => `${v.marca} ${v.modeloMkt || v.modelo} ${v.ano}`).join(', '));
   log.info(`Config local: MAX_POR_CICLO=${MAX_POR_CICLO} | DELAY=${DELAY_MIN}-${DELAY_MAX}ms | DRY_RUN=${DRY_RUN}`);
 
-  const CHROME_CMD = `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --remote-debugging-port=${CDP_PORT} --user-data-dir="C:\\Users\\User\\chrome-bot-perfil-${CDP_PORT}"`;
+  const userHome = process.env.USERPROFILE || process.env.HOME || 'C:\\Users\\User';
+  const CHROME_ARGS = [
+    `--remote-debugging-port=${CDP_PORT}`,
+    `--user-data-dir=${userHome}\\chrome-bot-perfil-${CDP_PORT}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+  ];
+  const CHROME_CMD = `chrome.exe --remote-debugging-port=${CDP_PORT} --user-data-dir="${userHome}\\chrome-bot-perfil-${CDP_PORT}"`;
+
+  function launchChrome() {
+    const { spawn } = require('child_process');
+    const chromePaths = [
+      'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+      'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    ];
+    const chromePath = chromePaths.find(p => require('fs').existsSync(p));
+    if (!chromePath) { log.error('Chrome não encontrado. Instale o Google Chrome.'); return; }
+    log.info(`Abrindo Chrome na porta ${CDP_PORT}...`);
+    const proc = spawn(chromePath, CHROME_ARGS, { detached: true, stdio: 'ignore' });
+    proc.unref();
+  }
 
   // Loop externo de reconexão — nunca deixa o bot morrer
   while (true) {
     let browser, page;
     try {
+      launchChrome();
+      await new Promise(r => setTimeout(r, 4000)); // aguarda Chrome abrir
       log.info('Conectando ao Chrome...');
       browser = await chromium.connectOverCDP(`http://localhost:${CDP_PORT}`);
       const context = browser.contexts()[0];

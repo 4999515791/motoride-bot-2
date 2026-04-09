@@ -10,7 +10,7 @@ require('dotenv').config();
 
 const log           = require('./modules/logger');
 const VEHICLES_FILE = path.join(__dirname, 'data', 'vehicles.json');
-const FOTOS_BASE    = process.env.FOTOS_DIR || 'C:\\Users\\User\\Desktop\\motos para postagem';
+const FOTOS_BASE    = process.env.FOTOS_DIR || require('path').join(process.env.USERPROFILE || process.env.HOME || 'C:\\Users\\User', 'Desktop', 'motos para postagem');
 const TEMP_DIR      = path.join(__dirname, 'temp_fotos');
 
 // ── CRM (Lovable Edge Functions) ─────────────────────────
@@ -121,13 +121,17 @@ async function marcarComandoErro(id, erro) {
 }
 
 async function lerConfiguracaoCRM() {
-  const result = await chamarEdgeFunction('bot-get-config', { bot_type: 'posting' });
-  return (result && result.config) ? result.config : null;
+  const result = await chamarEdgeFunction('bot-get-config', { bot_id: BOT_ID, bot_type: 'posting' });
+  if (!result) return null;
+  const data = result.config || result;
+  if (!data || !data.bot_id) return null;
+  return { ...data, is_active: data.is_active ?? data.ativo };
 }
 
 async function enviarHeartbeat(configId) {
   if (!configId) return;
   await chamarEdgeFunction('bot-heartbeat', {
+    bot_id:    BOT_ID,
     config_id: configId,
     bot_type:  'posting',
     timestamp: new Date().toISOString(),
