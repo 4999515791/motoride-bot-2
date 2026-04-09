@@ -101,29 +101,38 @@ async function marcarErro(id, msg) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// Retorna id do select "Método de Financiamento": leve=5, pesada=4
 function idTabelaFinanciamento(tabela_fin) {
   return tabela_fin === 'pesada' ? '4' : '5';
 }
 
-// Mapeamento: nº de parcelas (texto) → id interno do select da Aqui Financiamentos
 const PARCELAS_ID = { '6':1,'12':2,'15':10,'18':4,'24':3,'30':5,'36':6,'40':7,'42':8,'48':9 };
-
-// Coeficientes: nome → id interno do select
-const COEF_ID = { 'A':2,'B':3,'C':4,'D':5,'Unico':6 };
+const COEF_ID     = { 'A':2,'B':3,'C':4,'D':5,'Unico':6 };
 
 // ── Envio da ficha ────────────────────────────────────────────────────────────
 
 async function enviarFicha(ficha) {
   log.info(`[financiamento] Iniciando envio ficha ${ficha.id} — ${ficha.nome}`);
 
-  // Chrome estável: sem sandbox (necessário em ambientes Windows/server), sem GPU
   const browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-software-rasterizer'],
+    args: [
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-software-rasterizer',
+    ],
   });
-  const context = await browser.newContext();
-  const page    = await context.newPage();
+
+  // Aparência de Chrome real (reduz risco de detecção/redirect anti-bot)
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    viewport:  { width: 1280, height: 800 },
+  });
+
+  // Bloqueia imagens, fontes e mídia — reduz RAM e evita crash por OOM
+  await context.route(/\.(png|jpe?g|gif|svg|ico|woff2?|ttf|eot|mp4|webm|otf)(\?.*)?$/i, route => route.abort());
+
+  const page = await context.newPage();
 
   try {
     // ── 1. Login ─────────────────────────────────────────────────────────────
@@ -134,64 +143,81 @@ async function enviarFicha(ficha) {
     await page.waitForURL('**/novaFichaCadastral.php', { timeout: 20000 });
     log.ok('[financiamento] Login realizado');
 
-    // Aguarda a página carregar completamente antes de preencher
-    await page.waitForLoadState('domcontentloaded');
-    await page.waitForTimeout(1500);
+    // ── 2. Aguarda carregamento real da página de ficha ───────────────────────
+    // Espera o campo #nome aparecer (confirma que o HTML do formulário está presente)
+    await page.waitForSelector('#nome', { state: 'attached', timeout: 20000 });
 
-    // ── 2. Preenche TODOS os campos via evaluate (sem page.fill — evita Target crashed) ──
-    // Usar page.fill em campos disabled/dinâmicos causa crash do Chrome.
-    // evaluate roda no contexto do browser e define os valores diretamente no DOM
-    // sem disparar os event listeners JavaScript do site que causam instabilidade.
+    // Screenshot diagnóstica logo após o carregamento (antes de tocar em qualquer campo)
+    await page.screenshot({
+      path: path.join(__dirname, 'logs', `ficha-${ficha.id}-carregada.png`),
+    });
 
+    // Verifica que não houve redirect inesperado
+    const urlAtualPos = page.url();
+    if (!urlAtualPos.includes('novaFichaCadastral.php')) {
+      throw new Error(`Redirect inesperado após login: ${urlAtualPos}`);
+    }
+
+    log.ok('[financiamento] Formulário carregado — iniciando preenchimento');
+
+    // ── 3. Simulação: seleções que precisam de eventos para inicializar o form ─
+    // idTabela e anoItem disparam JS do site que habilita/ajusta outros campos.
+    // Usamos selectOption que dispara change events, igual ao comportamento humano.
+    await page.selectOption('#idTabela', idTabelaFinanciamento(ficha.tabela_fin));
+    await page.waitForTimeout(600);
+    await page.selectOption('#anoItem', String(ficha.veiculo_ano || '2013'));
+    await page.waitForTimeout(600);
+
+    // ── 4. Todos os outros campos via evaluate ────────────────────────────────
+    // page.fill em campos disabled/dinâmicos causa Target crashed.
+    // evaluate define os valores diretamente no DOM sem esperar locators.
     const dados = {
-      idTabela:  idTabelaFinanciamento(ficha.tabela_fin),
-      anoItem:   String(ficha.veiculo_ano || '2013'),
-      valor:     ficha.valor_financiado ? Number(ficha.valor_financiado).toFixed(2).replace('.', ',') : '',
-      coef:      ficha.coeficiente      ? String(COEF_ID[ficha.coeficiente] || 2) : '',
-      parcelas:  ficha.num_parcelas     ? String(PARCELAS_ID[String(ficha.num_parcelas)] || 3) : '',
-      parcela:   ficha.valor_parcela    ? Number(ficha.valor_parcela).toFixed(2) : '',
+      valor:    ficha.valor_financiado ? Number(ficha.valor_financiado).toFixed(2).replace('.', ',') : '',
+      coef:     ficha.coeficiente      ? String(COEF_ID[ficha.coeficiente] || 2)                    : '',
+      parcelas: ficha.num_parcelas     ? String(PARCELAS_ID[String(ficha.num_parcelas)] || 3)        : '',
+      parcela:  ficha.valor_parcela    ? Number(ficha.valor_parcela).toFixed(2)                      : '',
       // Pessoais
-      nome:         ficha.nome         || '',
-      nascimento:   ficha.nascimento   || '',
-      mae:          ficha.mae          || '',
-      cpf:          ficha.cpf          || '',
-      dddcelular:   ficha.ddd_celular  || '',
-      celular:      ficha.celular      || '',
-      cep:          ficha.cep          || '',
-      endereco:     ficha.endereco     || '',
-      num:          ficha.num_end      || '',
-      bairro:       ficha.bairro       || '',
-      cidade:       ficha.cidade       || '',
-      ufend:        ficha.uf           || '',
-      moradia:      ficha.moradia      || '',
-      anores:       ficha.anos_residencia || '',
+      nome:        ficha.nome          || '',
+      nascimento:  ficha.nascimento    || '',
+      mae:         ficha.mae           || '',
+      cpf:         ficha.cpf           || '',
+      dddcelular:  ficha.ddd_celular   || '',
+      celular:     ficha.celular       || '',
+      cep:         ficha.cep           || '',
+      endereco:    ficha.endereco      || '',
+      num:         ficha.num_end       || '',
+      bairro:      ficha.bairro        || '',
+      cidade:      ficha.cidade        || '',
+      ufend:       ficha.uf            || '',
+      moradia:     ficha.moradia       || '',
+      anores:      ficha.anos_residencia || '',
       // Profissionais
-      empresa:      ficha.empresa      || '',
+      empresa:      ficha.empresa       || '',
       tempoemprego: ficha.tempo_emprego || '',
-      cepemp:       ficha.cep_emp      || '',
-      enderecoemp:  ficha.endereco_emp || '',
-      numemp:       ficha.num_emp      || '',
-      bairroemp:    ficha.bairro_emp   || '',
-      cidadeemp:    ficha.cidade_emp   || '',
-      ufemp:        ficha.uf_emp       || '',
-      dddtelemp:    ficha.ddd_tel_emp  || '',
-      telemp:       ficha.tel_emp      || '',
-      funcao:       ficha.funcao       || '',
-      rendab:       ficha.renda_bruta  || '',
+      cepemp:       ficha.cep_emp       || '',
+      enderecoemp:  ficha.endereco_emp  || '',
+      numemp:       ficha.num_emp       || '',
+      bairroemp:    ficha.bairro_emp    || '',
+      cidadeemp:    ficha.cidade_emp    || '',
+      ufemp:        ficha.uf_emp        || '',
+      dddtelemp:    ficha.ddd_tel_emp   || '',
+      telemp:       ficha.tel_emp       || '',
+      funcao:       ficha.funcao        || '',
+      rendab:       ficha.renda_bruta   || '',
       // Referências
-      ref1:         ficha.ref1_nome    || '',
-      dddtelref1:   ficha.ref1_ddd     || '',
-      telref1:      ficha.ref1_tel     || '',
-      ref2:         ficha.ref2_nome    || '',
-      dddtelref2:   ficha.ref2_ddd     || '',
-      telref2:      ficha.ref2_tel     || '',
+      ref1:       ficha.ref1_nome || '',
+      dddtelref1: ficha.ref1_ddd  || '',
+      telref1:    ficha.ref1_tel  || '',
+      ref2:       ficha.ref2_nome || '',
+      dddtelref2: ficha.ref2_ddd  || '',
+      telref2:    ficha.ref2_tel  || '',
       // Garantia
-      marca:        ficha.veiculo_marca  || '',
-      modelo:       ficha.veiculo_modelo || '',
-      fabricacao:   String(ficha.veiculo_ano || ''),
-      amodelo:      String(ficha.veiculo_ano || ''),
-      placa:        ficha.veiculo_placa  || '',
-      // Loja (fixo)
+      marca:      ficha.veiculo_marca  || '',
+      modelo:     ficha.veiculo_modelo || '',
+      fabricacao: String(ficha.veiculo_ano || ''),
+      amodelo:    String(ficha.veiculo_ano || ''),
+      placa:      ficha.veiculo_placa  || '',
+      // Loja
       dddtelcontato: AQUI_DDD_TEL,
       telcontato:    AQUI_TEL,
       nomecontato:   AQUI_NOME_CONTATO,
@@ -201,67 +227,56 @@ async function enviarFicha(ficha) {
     };
 
     await page.evaluate((d) => {
-      // Seta valor de input por ID (habilita o campo se estiver disabled)
       function setVal(id, val) {
         if (val == null || val === '') return;
         const el = document.getElementById(id);
         if (!el) return;
         el.disabled = false;
         el.readOnly = false;
-        el.value = String(val);
+        el.value    = String(val);
       }
-
-      // Seta select por ID usando value ou label
-      function setSelect(id, val) {
+      function setSelectById(id, val) {
         if (val == null || val === '') return;
         const el = document.getElementById(id);
         if (!el) return;
         el.disabled = false;
         const opts = Array.from(el.options);
-        const byVal   = opts.find(o => o.value === String(val));
-        const byLabel = opts.find(o => o.text.trim() === String(val));
-        if (byVal)   { el.value = byVal.value;   return; }
-        if (byLabel) { el.value = byLabel.value;  return; }
+        const m = opts.find(o => o.value === String(val)) || opts.find(o => o.text.trim() === String(val));
+        if (m) el.value = m.value;
       }
 
-      // ── Simulação ───────────────────────────────────────────────────────────
-      setSelect('idTabela',    d.idTabela);
-      setSelect('anoItem',     d.anoItem);
-      setVal('valor',          d.valor);
-      setSelect('coeficiente', d.coef);
-      setSelect('parcelas',    d.parcelas);
-      setVal('parcela',        d.parcela);
+      // Simulação (os selects já foram feitos via selectOption; só valor/coef/parcelas/parcela)
+      setVal('valor', d.valor);
+      setSelectById('coeficiente', d.coef);
+      setSelectById('parcelas', d.parcelas);
+      setVal('parcela', d.parcela);
 
-      // ── Dados Pessoais ──────────────────────────────────────────────────────
-      setVal('nome',        d.nome);
-      setVal('nascimento',  d.nascimento);
-      setVal('mae',         d.mae);
-      setVal('cpf',         d.cpf);
-      setVal('dddcelular',  d.dddcelular);
-      setVal('celular',     d.celular);
-      setVal('cep',         d.cep);
-      setVal('endereco',    d.endereco);
-      setVal('num',         d.num);
-
-      // Bairro residencial: input[name="bairro"] que não seja do empregador
-      const bairroInputs = document.querySelectorAll('input[name="bairro"]');
-      bairroInputs.forEach(el => {
+      // Dados pessoais
+      setVal('nome',       d.nome);
+      setVal('nascimento', d.nascimento);
+      setVal('mae',        d.mae);
+      setVal('cpf',        d.cpf);
+      setVal('dddcelular', d.dddcelular);
+      setVal('celular',    d.celular);
+      setVal('cep',        d.cep);
+      setVal('endereco',   d.endereco);
+      setVal('num',        d.num);
+      // Bairro residencial: exclui campos do empregador
+      document.querySelectorAll('input[name="bairro"]').forEach(el => {
         if (!el.id || !el.id.toLowerCase().includes('emp')) {
           el.disabled = false;
-          el.value = d.bairro;
+          el.value    = d.bairro;
         }
       });
-
-      setVal('cidade',      d.cidade);
-      setVal('ufend',       d.ufend);
-      setSelect('moradia',  d.moradia);
-      setVal('anores',      d.anores);
-
+      setVal('cidade',       d.cidade);
+      setVal('ufend',        d.ufend);
+      setSelectById('moradia', d.moradia);
+      setVal('anores',       d.anores);
       // Sexo padrão M
       const radios = document.querySelectorAll('input[name="sexo"]');
       if (radios.length > 0) radios[0].checked = true;
 
-      // ── Dados Profissionais ─────────────────────────────────────────────────
+      // Dados profissionais
       setVal('empresa',      d.empresa);
       setVal('tempoemprego', d.tempoemprego);
       setVal('cepemp',       d.cepemp);
@@ -275,7 +290,7 @@ async function enviarFicha(ficha) {
       setVal('funcao',       d.funcao);
       setVal('rendab',       d.rendab);
 
-      // ── Referências ─────────────────────────────────────────────────────────
+      // Referências
       setVal('ref1',       d.ref1);
       setVal('dddtelref1', d.dddtelref1);
       setVal('telref1',    d.telref1);
@@ -283,13 +298,12 @@ async function enviarFicha(ficha) {
       setVal('dddtelref2', d.dddtelref2);
       setVal('telref2',    d.telref2);
 
-      // ── Dados da Garantia ───────────────────────────────────────────────────
+      // Garantia
       setVal('marca',      d.marca);
       setVal('modelo',     d.modelo);
       setVal('fabricacao', d.fabricacao);
       setVal('amodelo',    d.amodelo);
       setVal('placa',      d.placa);
-
       // Tipo: Moto
       document.querySelectorAll('input[name="tipo"]').forEach(r => {
         if (r.value === 'Moto') r.checked = true;
@@ -299,7 +313,7 @@ async function enviarFicha(ficha) {
         if (r.id !== 'condNovo') r.checked = true;
       });
 
-      // ── Informações da Loja ─────────────────────────────────────────────────
+      // Loja
       setVal('dddtelcontato', d.dddtelcontato);
       setVal('telcontato',    d.telcontato);
       setVal('nomecontato',   d.nomecontato);
@@ -310,17 +324,17 @@ async function enviarFicha(ficha) {
 
     log.ok('[financiamento] Formulário preenchido');
 
-    // ── 3. Screenshot antes de enviar ────────────────────────────────────────
+    // ── 5. Screenshot antes de enviar ────────────────────────────────────────
     await page.screenshot({
       path: path.join(__dirname, 'logs', `ficha-${ficha.id}-antes.png`),
       fullPage: true,
     });
 
-    // ── 4. Enviar ─────────────────────────────────────────────────────────────
+    // ── 6. Enviar ─────────────────────────────────────────────────────────────
     await page.evaluate(() => {
-      const btns = Array.from(document.querySelectorAll('input[type="button"], input[type="submit"], button'));
+      const btns   = Array.from(document.querySelectorAll('input[type="button"], input[type="submit"], button'));
       const enviar = btns.find(b =>
-        (b.value && b.value.toLowerCase().includes('enviar')) ||
+        (b.value       && b.value.toLowerCase().includes('enviar')) ||
         (b.textContent && b.textContent.toLowerCase().includes('enviar'))
       );
       if (enviar) enviar.click();
@@ -352,7 +366,6 @@ async function enviarFicha(ficha) {
 
 // ── Daemon principal ──────────────────────────────────────────────────────────
 
-// Reseta fichas presas em 'processando' (crash anterior sem marcarErro)
 async function resetarFichasTravas() {
   const rows = await supabaseGet('financiamento_fichas?status=eq.processando');
   if (Array.isArray(rows) && rows.length > 0) {
@@ -368,8 +381,6 @@ async function resetarFichasTravas() {
 
 async function daemon() {
   log.info('[financiamento] Daemon iniciado. Aguardando fichas pendentes a cada 30s...');
-
-  // Limpa fichas que ficaram em 'processando' por crash anterior
   await resetarFichasTravas();
 
   while (true) {
@@ -405,7 +416,6 @@ async function daemon() {
 const fichaId = process.argv[2];
 
 if (fichaId) {
-  // Modo manual: envia uma ficha específica pelo ID
   (async () => {
     const ficha = await buscarFichaPorId(fichaId);
     if (!ficha) { log.error(`Ficha ${fichaId} não encontrada`); process.exit(1); }
