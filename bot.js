@@ -958,7 +958,10 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
                 // Relê leads do disco para evitar sobrescrever dados de outras conversas
                 const leadsAtual = loadJSON(LEADS_FILE);
                 const leadAtual  = leadsAtual[convId] || lead;
-                leadAtual.crmRegistrado = true;
+                leadAtual.crmRegistrado  = true;
+                leadAtual.nome           = compradorNome;
+                leadAtual.vehicleLabel   = veiculo ? `${veiculo.marca} ${veiculo.modelo} ${veiculo.ano}` : null;
+                leadAtual.vehicleId      = veiculo?.id || null;
                 if (tel) leadAtual.crmTemTelefone = true;
                 leadAtual.crmLeadId = id;
                 leadsAtual[convId] = leadAtual;
