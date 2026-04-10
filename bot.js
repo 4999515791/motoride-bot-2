@@ -414,7 +414,9 @@ REGRAS ABSOLUTAS:
 - Nunca fazer mais de 1 pergunta por vez
 - NÃO repita perguntas que o cliente já respondeu — leia o histórico
 - NÃO peça WhatsApp se o cliente já passou o número
-- Não inventar informações do veículo
+- NUNCA mencione ou sugira outro veículo que não seja o listado acima — fale APENAS do veículo desta conversa
+- NUNCA use o nome do cliente na resposta se ele não se apresentou no histórico — não invente nomes
+- Não inventar informações do veículo que não estejam no briefing acima
 - Nunca usar emojis, asteriscos ou markdown
 - PROIBIDO mencionar qualquer link, URL ou endereço de site
 - PROIBIDO mencionar nosso número de telefone — APENAS peça o número DO CLIENTE
@@ -573,7 +575,11 @@ async function lerMensagensPopup(page) {
     const input = document.querySelector('[contenteditable="true"][role="textbox"]');
     const inputTop = input ? input.getBoundingClientRect().top : window.innerHeight;
 
-    for (const el of document.querySelectorAll('[dir="auto"]')) {
+    // Escopa APENAS ao painel principal — exclui o sidebar do inbox que contém
+    // linhas de outras conversas ("Susan · Fazer 150") que seriam lidas como msgs do cliente
+    const painelPrincipal = document.querySelector('[role="main"]') || document.body;
+
+    for (const el of painelPrincipal.querySelectorAll('[dir="auto"]')) {
       const rect = el.getBoundingClientRect();
       // Ignora elementos abaixo da área de digitação ou fora da tela
       if (rect.top >= inputTop) continue;
@@ -737,19 +743,36 @@ async function identificarVeiculo(page, ativos, vehicleHint) {
     if (v) { log.info(`  Veículo (link anúncio): ${v.marca} ${v.modelo} ${v.ano}`); return v; }
   }
 
-  // 3) Texto da página (fallback) — sempre tenta, mesmo se havia hint mas não bateu
-  // Hint contaminado (ex: "Honda CG 125Mensagem não lida") não deve bloquear este fallback
+  // 3) Header do anúncio Marketplace: linha "R$X.XXX — Veículo Ano" — NÃO usa document.body
+  // (document.body inclui sidebar do inbox com outras conversas e contamina a detecção)
   if (vehicleHint && vehicleHint.trim().length > 3) {
-    log.warn(`  Hint "${vehicleHint}" não bateu no estoque — tentando fallback DOM/página`);
+    log.warn(`  Hint "${vehicleHint}" não bateu no estoque — tentando header do anúncio`);
   }
-  const snippet = await page.evaluate(() => (document.body.innerText || '').toLowerCase().slice(0, 2000));
-  const v = ativos.find(v => snippet.includes((v.modelo||'').toLowerCase()) && snippet.includes(String(v.ano)))
-         || ativos.find(v => (v.modelo||'').length > 2 && snippet.includes((v.modelo||'').toLowerCase()));
-  if (v) { log.info(`  Veículo (página): ${v.marca} ${v.modelo} ${v.ano}`); return v; }
+  const snippet = await page.evaluate(() => {
+    // Busca a linha de preço/título do anúncio (ex: "R$6.500 — 2004 Honda Bros")
+    const allDirs = Array.from(document.querySelectorAll('[dir="auto"]'));
+    const headerEl = allDirs.find(el => /R\$[\d.,]+\s*[—–]/.test(el.textContent || ''));
+    if (!headerEl) return '';
+    // Sobe até 5 níveis para pegar o bloco completo do header (inclui nome do veículo)
+    let parent = headerEl;
+    for (let i = 0; i < 5; i++) {
+      const pp = parent.parentElement;
+      if (!pp || pp.tagName === 'BODY') break;
+      const r = pp.getBoundingClientRect();
+      if (r.height > 150) break; // Para quando o container ficar muito grande
+      parent = pp;
+    }
+    return (parent.textContent || '').toLowerCase();
+  });
+  const v = snippet ? (
+    ativos.find(v => snippet.includes((v.modelo||'').toLowerCase()) && snippet.includes(String(v.ano)))
+    || ativos.find(v => (v.modelo||'').length > 2 && snippet.includes((v.modelo||'').toLowerCase()))
+  ) : null;
+  if (v) { log.info(`  Veículo (header anúncio): ${v.marca} ${v.modelo} ${v.ano}`); return v; }
 
-  // Só declara fora de estoque depois de esgotar todas as fontes
+  // Esgotou todas as fontes — veículo fora do estoque
   if (vehicleHint && vehicleHint.trim().length > 3) {
-    log.warn(`  Veículo definitivamente não encontrado para hint: "${vehicleHint}"`);
+    log.warn(`  Veículo "${vehicleHint}" não está no estoque — respondendo como fora de estoque`);
   }
   return null;
 }
