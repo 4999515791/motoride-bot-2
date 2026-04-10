@@ -284,12 +284,14 @@ async function sincronizarLeadCRM(convId, compradorNome, veiculo, historico, tel
   // Upsert direto na tabela leads — resolve conflito por conv_id
   const result = await supabaseRestPost('leads', payload, 'conv_id');
   if (!result || (result.code && result.message)) {
-    log.warn(`[CRM] Falha ao salvar lead: ${result?.message || 'sem resposta'} | ${JSON.stringify(result||{}).slice(0,200)}`);
+    log.warn(`[CRM] Falha ao salvar lead: ${result?.message || 'sem resposta'} | ${JSON.stringify(result||{}).slice(0,300)}`);
     return null;
   }
 
+  // result=[] significa que o Supabase salvou mas RLS bloqueia o SELECT de retorno
+  // Nesse caso considera sucesso e usa convId como referência
   const row = Array.isArray(result) ? result[0] : result;
-  const clientId = row?.id || null;
+  const clientId = row?.id || convId;
   log.ok(`[CRM] Lead salvo: ${nomeReal} → ${clientId}`);
   return clientId;
 }
@@ -714,19 +716,27 @@ async function detectarRows(page) {
 
 // ── Identifica veículo pelo hint da row ou conteúdo da página ───────────────
 async function identificarVeiculo(page, ativos, vehicleHint) {
-  // 1) Row hint: "2007 Honda Titan 150" — diferencia modelos pelo ano
+  // Verifica se o texto contém o modelo ou modeloMkt do veículo
+  const matchModelo = (v, txt) => {
+    const m  = (v.modelo   || '').toLowerCase();
+    const mk = (v.modeloMkt|| '').toLowerCase();
+    return (m.length  > 2 && txt.includes(m))  ||
+           (mk.length > 2 && mk !== m && txt.includes(mk));
+  };
+
+  // 1) Row hint: "2007 Honda Titan 150" ou "2004 Honda Bros" — diferencia modelos pelo ano
   if (vehicleHint) {
     const hint = vehicleHint.toLowerCase();
     const v =
-      ativos.find(v => hint.includes((v.modelo||'').toLowerCase()) && hint.includes(String(v.ano))) ||
-      ativos.find(v => hint.includes((v.modelo||'').toLowerCase()) && hint.includes((v.marca||'').toLowerCase())) ||
-      ativos.find(v => (v.modelo||'').length > 2 && hint.includes((v.modelo||'').toLowerCase()));
+      ativos.find(v => matchModelo(v, hint) && hint.includes(String(v.ano))) ||
+      ativos.find(v => matchModelo(v, hint) && hint.includes((v.marca||'').toLowerCase())) ||
+      ativos.find(v => matchModelo(v, hint));
     if (v) { log.info(`  Veículo (row hint): ${v.marca} ${v.modelo} ${v.ano}`); return v; }
 
-    // 1b) pastaFotos como alias — ex: "CG 150 EX 2012"
+    // 1b) pastaFotos como alias — ex: "CG 150 EX 2012" (só quando carregado do JSON local)
     const vAlias = ativos.find(v => {
       const palavras = (v.pastaFotos || '').toLowerCase().split(/\s+/).filter(w => w.length > 2);
-      return palavras.filter(w => hint.includes(w)).length >= 2;
+      return palavras.length >= 2 && palavras.filter(w => hint.includes(w)).length >= 2;
     });
     if (vAlias) { log.info(`  Veículo (pastaFotos alias): ${vAlias.marca} ${vAlias.modelo} ${vAlias.ano}`); return vAlias; }
   }
@@ -738,8 +748,8 @@ async function identificarVeiculo(page, ativos, vehicleHint) {
   });
   if (tituloAnuncio) {
     const t = tituloAnuncio.toLowerCase();
-    const v = ativos.find(v => t.includes((v.modelo||'').toLowerCase()) && t.includes(String(v.ano)))
-           || ativos.find(v => t.includes((v.modelo||'').toLowerCase()));
+    const v = ativos.find(v => matchModelo(v, t) && t.includes(String(v.ano)))
+           || ativos.find(v => matchModelo(v, t));
     if (v) { log.info(`  Veículo (link anúncio): ${v.marca} ${v.modelo} ${v.ano}`); return v; }
   }
 
@@ -765,8 +775,8 @@ async function identificarVeiculo(page, ativos, vehicleHint) {
     return (parent.textContent || '').toLowerCase();
   });
   const v = snippet ? (
-    ativos.find(v => snippet.includes((v.modelo||'').toLowerCase()) && snippet.includes(String(v.ano)))
-    || ativos.find(v => (v.modelo||'').length > 2 && snippet.includes((v.modelo||'').toLowerCase()))
+    ativos.find(v => matchModelo(v, snippet) && snippet.includes(String(v.ano)))
+    || ativos.find(v => matchModelo(v, snippet))
   ) : null;
   if (v) { log.info(`  Veículo (header anúncio): ${v.marca} ${v.modelo} ${v.ano}`); return v; }
 
