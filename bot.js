@@ -697,13 +697,22 @@ async function baixarMidia(url, destino) {
       fim(false);
     }, 60_000);
 
+    const supabaseHost = SUPABASE_URL ? new URL(SUPABASE_URL).hostname : null;
+
     const fazDownload = (urlStr, tentativa) => {
       const parsedUrl = new URL(urlStr);
+      // Inclui auth do Supabase apenas para o host do projeto (não para redirects externos)
+      const ehSupabase = supabaseHost && parsedUrl.hostname === supabaseHost;
+      const headers = { 'User-Agent': 'Mozilla/5.0' };
+      if (ehSupabase && SUPABASE_ANON_KEY) {
+        headers['apikey']        = SUPABASE_ANON_KEY;
+        headers['Authorization'] = `Bearer ${SUPABASE_ANON_KEY}`;
+      }
       const opts = {
         hostname: parsedUrl.hostname,
         path:     parsedUrl.pathname + parsedUrl.search,
         method:   'GET',
-        headers:  { 'User-Agent': 'Mozilla/5.0' },
+        headers,
       };
       const req = https.request(opts, (res) => {
         if ((res.statusCode === 301 || res.statusCode === 302) && tentativa < 3) {
@@ -855,10 +864,13 @@ async function comprimirVideo(inputPath, outputPath, targetMB = 20) {
 async function enviarMidiaVeiculo(page, veiculo, convId) {
   if (!veiculo || (!veiculo.audio_url && !veiculo.video_url)) {
     log.info(`[Mídia] Sem audio_url/video_url para ${veiculo?.id || convId} — pulando`);
-    return;
+    return { audioEnviado: false, videoEnviado: false };
   }
   log.info(`[Mídia] Iniciando envio | audio: ${!!veiculo.audio_url} | video: ${!!veiculo.video_url}`);
   if (!fs.existsSync(TEMP_MIDIA)) fs.mkdirSync(TEMP_MIDIA, { recursive: true });
+
+  let audioEnviado = false;
+  let videoEnviado = false;
 
   // Áudio
   if (veiculo.audio_url) {
@@ -880,8 +892,10 @@ async function enviarMidiaVeiculo(page, veiculo, convId) {
         log.info(`[Mídia] Chamando enviarArquivo() para áudio...`);
         const enviou = await enviarArquivo(page, dest);
         if (enviou) {
+          audioEnviado = true;
           log.ok(`[Mídia] Áudio enviado para ${convId}`);
-          await delayAleatorio();
+          // Aguarda DOM estabilizar antes de tentar o vídeo
+          await page.waitForTimeout(2000);
         } else {
           log.warn(`[Mídia] enviarArquivo() retornou false para áudio — input[type=file] não encontrado ou setInputFiles falhou`);
         }
@@ -932,8 +946,8 @@ async function enviarMidiaVeiculo(page, veiculo, convId) {
           log.info(`[Mídia] Chamando enviarArquivo() para vídeo...`);
           const enviou = await enviarArquivo(page, paraEnviar);
           if (enviou) {
+            videoEnviado = true;
             log.ok(`[Mídia] Vídeo enviado para ${convId}`);
-            await delayAleatorio();
           } else {
             log.warn(`[Mídia] enviarArquivo() retornou false para vídeo`);
           }
@@ -946,6 +960,9 @@ async function enviarMidiaVeiculo(page, veiculo, convId) {
       try { if (destFinal)    fs.unlinkSync(destFinal);    } catch {}
     }
   }
+
+  log.info(`[Mídia] Resultado — audioEnviado: ${audioEnviado} | videoEnviado: ${videoEnviado}`);
+  return { audioEnviado, videoEnviado };
 }
 
 // ── Detecta rows de conversa no inbox ───────────────────
@@ -1179,11 +1196,15 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
     }
     log.info(`[${foraDeEstoque ? 'fora de estoque' : veiculo.marca + ' ' + veiculo.modelo}] Conversa ${convId} | "${ultima.slice(0,60)}"`);
 
-    // ── Envia áudio/vídeo no primeiro contato (nunca bloqueia o texto) ──────────
+    // ── Envia áudio/vídeo no primeiro contato ──────────────────────────────────
     const ehPrimeiroContato = !lead.historico || lead.historico.length === 0;
+    let audioEnviado = false;
+    let videoEnviado = false;
     if (ehPrimeiroContato && !lead.midiaEnviada && !foraDeEstoque && veiculo) {
       try {
-        await enviarMidiaVeiculo(page, veiculo, convId);
+        const resultadoMidia = await enviarMidiaVeiculo(page, veiculo, convId);
+        audioEnviado = resultadoMidia?.audioEnviado || false;
+        videoEnviado = resultadoMidia?.videoEnviado || false;
       } catch (e) {
         log.warn(`[Mídia] Erro inesperado — texto será enviado normalmente: ${e.message}`);
       }
@@ -1191,6 +1212,26 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
       leads[convId] = lead;
       saveJSON(LEADS_FILE, leads);
     }
+
+    // ── Decide se envia texto com base no que foi enviado de mídia ─────────────
+    // • Áudio (com ou sem vídeo) → não envia texto (áudio já abre o atendimento)
+    // • Só vídeo → envia texto junto (vídeo sozinho não substitui a saudação)
+    // • Nada  → envia texto para o cliente não ficar sem resposta
+    const enviarTexto = !audioEnviado;
+    if (!enviarTexto) {
+      log.info(`[${convId}] Áudio enviado — texto suprimido no primeiro contato`);
+      // Registra a interação no histórico mesmo sem texto
+      lead.historico = [...(lead.historico || []), { de: 'cliente', texto: ultima }].slice(-20);
+      lead.fpRespondido    = fpAtual;
+      lead.followUpEnviado = false;
+      lead.ultimaAtividade = new Date().toISOString();
+      lead.ultimaEnvio     = new Date().toISOString();
+      leads[convId] = lead;
+      saveJSON(LEADS_FILE, leads);
+      respostasNoCiclo++;
+    }
+
+    if (!enviarTexto) return respostasNoCiclo;
 
     const contexto = todasMsgs.slice(0, -1).slice(-10);
     let resp;
@@ -1201,7 +1242,7 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
         : responderForaDeEstoque(vehicleHint);
     } else {
       resp = await responder(veiculo, contexto, ultima);
-      if (!resp) return; // resposta descartada pelo filtro de segurança
+      if (!resp) return respostasNoCiclo; // resposta descartada pelo filtro de segurança
     }
     log.info(`  Resposta: "${resp}"`);
     await delayAleatorio();
