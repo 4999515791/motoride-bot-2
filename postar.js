@@ -739,7 +739,20 @@ async function postarVeiculo(page, v) {
   log.info('Fazendo upload das fotos...');
   const fileInput = await page.$('input[type="file"]');
   if (fileInput) {
-    await fileInput.setInputFiles(fotos, { timeout: 90000 });
+    // Tenta até 2 vezes com timeout de 3 minutos cada
+    let uploadOk = false;
+    for (let tentativa = 1; tentativa <= 2; tentativa++) {
+      try {
+        log.info(`  [upload] Tentativa ${tentativa}/2 — ${fotos.length} foto(s)...`);
+        await fileInput.setInputFiles(fotos, { timeout: 180000 });
+        uploadOk = true;
+        break;
+      } catch (e) {
+        log.warn(`  [upload] Tentativa ${tentativa} falhou: ${e.message.slice(0, 80)}`);
+        if (tentativa < 2) await page.waitForTimeout(3000);
+      }
+    }
+    if (!uploadOk) throw new Error('Upload de fotos falhou após 2 tentativas — abortando postagem');
     log.info(`Aguardando upload de ${fotos.length} foto(s)...`);
     // Espera proporcional ao número de fotos (mínimo 7s, +1s por foto acima de 5)
     const esperaUpload = 7000 + Math.max(0, fotos.length - 5) * 1000;
