@@ -9,6 +9,7 @@ const https = require('https');
 
 // ── Config ───────────────────────────────────────────────
 const DRY_RUN      = process.env.DRY_RUN === 'true';
+const TEMP_MIDIA   = path.join(__dirname, 'temp_midia');
 const MAX_POR_CICLO = parseInt(process.env.MAX_POR_CICLO  || '5', 10);
 const DELAY_MIN    = parseInt(process.env.DELAY_MIN_MS    || '2000', 10);
 const DELAY_MAX    = parseInt(process.env.DELAY_MAX_MS    || '7000', 10);
@@ -175,6 +176,8 @@ function mapearVeiculoSupabase(row) {
     transfere:      row.transfere || 'sim',
     status:         row.status || 'ativo',
     ultimaPostagem: row.ultima_postagem || null,
+    audio_url:      row.audio_url || null,
+    video_url:      row.video_url || null,
   };
 }
 
@@ -678,6 +681,128 @@ async function enviar(page, texto) {
   return true;
 }
 
+// ── Download de mídia do Supabase Storage ────────────────────────────────────
+async function baixarMidia(url, destino) {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(path.dirname(destino))) {
+      fs.mkdirSync(path.dirname(destino), { recursive: true });
+    }
+    const parsedUrl = new URL(url);
+    const options = {
+      hostname: parsedUrl.hostname,
+      path:     parsedUrl.pathname + parsedUrl.search,
+      method:   'GET',
+      headers:  { 'User-Agent': 'Mozilla/5.0' },
+    };
+    const req = https.request(options, (res) => {
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        const loc = res.headers.location;
+        https.get(loc, (res2) => {
+          const out = fs.createWriteStream(destino);
+          res2.pipe(out);
+          out.on('finish', () => { out.close(); resolve(true); });
+          out.on('error',  () => resolve(false));
+        }).on('error', () => resolve(false));
+        return;
+      }
+      if (res.statusCode !== 200) { res.resume(); return resolve(false); }
+      const out = fs.createWriteStream(destino);
+      res.pipe(out);
+      out.on('finish', () => { out.close(); resolve(true); });
+      out.on('error',  () => resolve(false));
+    });
+    req.on('error', () => resolve(false));
+    req.end();
+  });
+}
+
+// ── Envia arquivo via Playwright no Messenger ─────────────────────────────────
+async function enviarArquivo(page, caminhoLocal) {
+  if (DRY_RUN) {
+    log.dry(`[simulado] enviar arquivo: ${path.basename(caminhoLocal)}`);
+    return true;
+  }
+  try {
+    // Tenta encontrar input[type="file"] — pode estar escondido no DOM do Messenger
+    let fileInput = await page.$('input[type="file"]');
+    if (!fileInput) {
+      // Clica no botão de anexo para expor o input
+      const btnAnexo = await page.$('[aria-label*="ttach"], [aria-label*="nexo"], [aria-label*="ile"]');
+      if (btnAnexo) {
+        await btnAnexo.click();
+        await page.waitForTimeout(800);
+        fileInput = await page.$('input[type="file"]');
+      }
+    }
+    if (!fileInput) {
+      log.warn('[enviarArquivo] input[type="file"] não encontrado no DOM');
+      return false;
+    }
+    await fileInput.setInputFiles(caminhoLocal);
+    await page.waitForTimeout(3000); // aguarda preview/thumb aparecer
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(2000);
+    return true;
+  } catch (e) {
+    log.warn(`[enviarArquivo] falhou: ${e.message}`);
+    return false;
+  }
+}
+
+// ── Envia mídia do veículo no primeiro contato (fallback silencioso) ──────────
+async function enviarMidiaVeiculo(page, veiculo, convId) {
+  if (!veiculo || (!veiculo.audio_url && !veiculo.video_url)) return;
+  if (!fs.existsSync(TEMP_MIDIA)) fs.mkdirSync(TEMP_MIDIA, { recursive: true });
+
+  // Áudio
+  if (veiculo.audio_url) {
+    try {
+      const ext  = (veiculo.audio_url.split('.').pop().split('?')[0] || 'ogg').slice(0, 4);
+      const dest = path.join(TEMP_MIDIA, `${convId}_audio.${ext}`);
+      log.info(`[Mídia] Baixando áudio do veículo...`);
+      const baixou = await baixarMidia(veiculo.audio_url, dest);
+      if (baixou) {
+        const enviou = await enviarArquivo(page, dest);
+        if (enviou) {
+          log.ok(`[Mídia] Áudio enviado para ${convId}`);
+          await delayAleatorio();
+        } else {
+          log.warn(`[Mídia] Falha ao enviar áudio — continuando atendimento`);
+        }
+        try { fs.unlinkSync(dest); } catch {}
+      } else {
+        log.warn(`[Mídia] Falha ao baixar áudio — continuando atendimento`);
+      }
+    } catch (e) {
+      log.warn(`[Mídia] Erro no áudio: ${e.message} — continuando atendimento`);
+    }
+  }
+
+  // Vídeo (ativo depois do Pro Supabase)
+  if (veiculo.video_url) {
+    try {
+      const ext  = (veiculo.video_url.split('.').pop().split('?')[0] || 'mp4').slice(0, 4);
+      const dest = path.join(TEMP_MIDIA, `${convId}_video.${ext}`);
+      log.info(`[Mídia] Baixando vídeo do veículo...`);
+      const baixou = await baixarMidia(veiculo.video_url, dest);
+      if (baixou) {
+        const enviou = await enviarArquivo(page, dest);
+        if (enviou) {
+          log.ok(`[Mídia] Vídeo enviado para ${convId}`);
+          await delayAleatorio();
+        } else {
+          log.warn(`[Mídia] Falha ao enviar vídeo — continuando atendimento`);
+        }
+        try { fs.unlinkSync(dest); } catch {}
+      } else {
+        log.warn(`[Mídia] Falha ao baixar vídeo — continuando atendimento`);
+      }
+    } catch (e) {
+      log.warn(`[Mídia] Erro no vídeo: ${e.message} — continuando atendimento`);
+    }
+  }
+}
+
 // ── Detecta rows de conversa no inbox ───────────────────
 async function detectarRows(page) {
   return page.evaluate(() => {
@@ -908,6 +1033,16 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
       return respostasNoCiclo;
     }
     log.info(`[${foraDeEstoque ? 'fora de estoque' : veiculo.marca + ' ' + veiculo.modelo}] Conversa ${convId} | "${ultima.slice(0,60)}"`);
+
+    // ── Envia áudio/vídeo no primeiro contato ─────────────────────────────
+    const ehPrimeiroContato = !lead.historico || lead.historico.length === 0;
+    if (ehPrimeiroContato && !lead.midiaEnviada && !foraDeEstoque && veiculo) {
+      await enviarMidiaVeiculo(page, veiculo, convId);
+      lead.midiaEnviada = true;
+      leads[convId] = lead;
+      saveJSON(LEADS_FILE, leads);
+    }
+
     const contexto = todasMsgs.slice(0, -1).slice(-10);
     let resp;
     if (foraDeEstoque) {
