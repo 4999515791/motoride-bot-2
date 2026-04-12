@@ -682,38 +682,44 @@ async function enviar(page, texto) {
   return true;
 }
 
-// ── Download de mídia do Supabase Storage ────────────────────────────────────
+// ── Download de mídia do Supabase Storage (timeout 60s) ──────────────────────
 async function baixarMidia(url, destino) {
   return new Promise((resolve) => {
     if (!fs.existsSync(path.dirname(destino))) {
       fs.mkdirSync(path.dirname(destino), { recursive: true });
     }
-    const parsedUrl = new URL(url);
-    const options = {
-      hostname: parsedUrl.hostname,
-      path:     parsedUrl.pathname + parsedUrl.search,
-      method:   'GET',
-      headers:  { 'User-Agent': 'Mozilla/5.0' },
+
+    let resolvido = false;
+    const fim = (ok) => { if (!resolvido) { resolvido = true; resolve(ok); } };
+
+    const timer = setTimeout(() => {
+      log.warn(`[baixarMidia] Timeout 60s — abortando: ${path.basename(destino)}`);
+      fim(false);
+    }, 60_000);
+
+    const fazDownload = (urlStr, tentativa) => {
+      const parsedUrl = new URL(urlStr);
+      const opts = {
+        hostname: parsedUrl.hostname,
+        path:     parsedUrl.pathname + parsedUrl.search,
+        method:   'GET',
+        headers:  { 'User-Agent': 'Mozilla/5.0' },
+      };
+      const req = https.request(opts, (res) => {
+        if ((res.statusCode === 301 || res.statusCode === 302) && tentativa < 3) {
+          return fazDownload(res.headers.location, tentativa + 1);
+        }
+        if (res.statusCode !== 200) { res.resume(); clearTimeout(timer); return fim(false); }
+        const out = fs.createWriteStream(destino);
+        res.pipe(out);
+        out.on('finish', () => { out.close(); clearTimeout(timer); fim(true); });
+        out.on('error',  () => { clearTimeout(timer); fim(false); });
+      });
+      req.on('error', () => { clearTimeout(timer); fim(false); });
+      req.end();
     };
-    const req = https.request(options, (res) => {
-      if (res.statusCode === 301 || res.statusCode === 302) {
-        const loc = res.headers.location;
-        https.get(loc, (res2) => {
-          const out = fs.createWriteStream(destino);
-          res2.pipe(out);
-          out.on('finish', () => { out.close(); resolve(true); });
-          out.on('error',  () => resolve(false));
-        }).on('error', () => resolve(false));
-        return;
-      }
-      if (res.statusCode !== 200) { res.resume(); return resolve(false); }
-      const out = fs.createWriteStream(destino);
-      res.pipe(out);
-      out.on('finish', () => { out.close(); resolve(true); });
-      out.on('error',  () => resolve(false));
-    });
-    req.on('error', () => resolve(false));
-    req.end();
+
+    fazDownload(url, 0);
   });
 }
 
@@ -724,28 +730,71 @@ async function enviarArquivo(page, caminhoLocal) {
     return true;
   }
   try {
-    // Tenta encontrar input[type="file"] — pode estar escondido no DOM do Messenger
+    const nomeArq = path.basename(caminhoLocal);
+    log.info(`[enviarArquivo] Tentando anexar: ${nomeArq}`);
+
+    // Procura input[type="file"] — no Messenger geralmente já está no DOM oculto
     let fileInput = await page.$('input[type="file"]');
     if (!fileInput) {
-      // Clica no botão de anexo para expor o input
-      const btnAnexo = await page.$('[aria-label*="ttach"], [aria-label*="nexo"], [aria-label*="ile"]');
+      // Clica no botão de clipe para expor o input
+      const btnAnexo = await page.$('[aria-label="Attach a file"], [aria-label="Annexer un fichier"], [aria-label*="Anexar"], [aria-label*="nexo"]');
       if (btnAnexo) {
+        log.info('[enviarArquivo] Clicando no botão de anexo...');
         await btnAnexo.click();
-        await page.waitForTimeout(800);
+        await page.waitForTimeout(1000);
         fileInput = await page.$('input[type="file"]');
       }
     }
+
     if (!fileInput) {
-      log.warn('[enviarArquivo] input[type="file"] não encontrado no DOM');
+      log.warn('[enviarArquivo] input[type="file"] não encontrado no DOM — Messenger pode ter mudado o layout');
       return false;
     }
+
+    log.info('[enviarArquivo] input[type="file"] encontrado — chamando setInputFiles...');
     await fileInput.setInputFiles(caminhoLocal);
-    await page.waitForTimeout(3000); // aguarda preview/thumb aparecer
-    await page.keyboard.press('Enter');
-    await page.waitForTimeout(2000);
+
+    // Aguarda o preview do arquivo aparecer (confirma que o attach funcionou)
+    const previewSeletores = [
+      '[data-testid="media-attachment-preview"]',
+      'img[class*="preview"]',
+      'div[class*="attachment"]',
+      'video[src]',
+      'audio[src]',
+    ];
+    let previewOk = false;
+    for (let i = 0; i < 6; i++) {
+      await page.waitForTimeout(800);
+      for (const sel of previewSeletores) {
+        if (await page.$(sel)) { previewOk = true; break; }
+      }
+      if (previewOk) break;
+    }
+    if (!previewOk) {
+      log.warn('[enviarArquivo] Preview não apareceu em 5s — tentando enviar mesmo assim');
+    } else {
+      log.info('[enviarArquivo] Preview detectado — enviando...');
+    }
+
+    // Tenta clicar no botão Enviar; fallback para Enter
+    const btnEnviar = await page.$('[aria-label="Send"], [aria-label="Envoyer"], [aria-label="Enviar"], [data-testid="send-button"]');
+    if (btnEnviar) {
+      await btnEnviar.click();
+    } else {
+      await page.keyboard.press('Enter');
+    }
+    await page.waitForTimeout(2500);
+
+    // Verifica se a página ainda está responsiva (campo de texto existe)
+    const campoTexto = await page.$('[contenteditable="true"][role="textbox"]');
+    if (!campoTexto) {
+      log.warn('[enviarArquivo] Campo de texto sumiu após envio — página pode estar em estado inesperado');
+    }
+
+    log.info(`[enviarArquivo] Arquivo ${nomeArq} enviado`);
     return true;
   } catch (e) {
-    log.warn(`[enviarArquivo] falhou: ${e.message}`);
+    log.warn(`[enviarArquivo] Exceção: ${e.message}`);
     return false;
   }
 }
@@ -804,7 +853,11 @@ async function comprimirVideo(inputPath, outputPath, targetMB = 20) {
 // ── Envia mídia do veículo no primeiro contato (fallback silencioso) ──────────
 
 async function enviarMidiaVeiculo(page, veiculo, convId) {
-  if (!veiculo || (!veiculo.audio_url && !veiculo.video_url)) return;
+  if (!veiculo || (!veiculo.audio_url && !veiculo.video_url)) {
+    log.info(`[Mídia] Sem audio_url/video_url para ${veiculo?.id || convId} — pulando`);
+    return;
+  }
+  log.info(`[Mídia] Iniciando envio | audio: ${!!veiculo.audio_url} | video: ${!!veiculo.video_url}`);
   if (!fs.existsSync(TEMP_MIDIA)) fs.mkdirSync(TEMP_MIDIA, { recursive: true });
 
   // Áudio
@@ -1126,10 +1179,14 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
     }
     log.info(`[${foraDeEstoque ? 'fora de estoque' : veiculo.marca + ' ' + veiculo.modelo}] Conversa ${convId} | "${ultima.slice(0,60)}"`);
 
-    // ── Envia áudio/vídeo no primeiro contato ─────────────────────────────
+    // ── Envia áudio/vídeo no primeiro contato (nunca bloqueia o texto) ──────────
     const ehPrimeiroContato = !lead.historico || lead.historico.length === 0;
     if (ehPrimeiroContato && !lead.midiaEnviada && !foraDeEstoque && veiculo) {
-      await enviarMidiaVeiculo(page, veiculo, convId);
+      try {
+        await enviarMidiaVeiculo(page, veiculo, convId);
+      } catch (e) {
+        log.warn(`[Mídia] Erro inesperado — texto será enviado normalmente: ${e.message}`);
+      }
       lead.midiaEnviada = true;
       leads[convId] = lead;
       saveJSON(LEADS_FILE, leads);
