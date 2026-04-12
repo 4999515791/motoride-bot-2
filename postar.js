@@ -95,6 +95,89 @@ async function supabasePatch(path, body) {
   });
 }
 
+// ── sessoes_fotos + fotos_offsets ─────────────────────────────────────────────
+async function buscarSessoesVeiculo(vehicleUuid) {
+  if (!vehicleUuid) return [];
+  const rows = await supabaseQuery(
+    `sessoes_fotos?veiculo_id=eq.${vehicleUuid}&order=ordem.asc`
+  );
+  return Array.isArray(rows) ? rows : [];
+}
+
+async function buscarOffsetBot(vehicleUuid) {
+  if (!vehicleUuid || !BOT_ID) return null;
+  const rows = await supabaseQuery(
+    `fotos_offsets?veiculo_id=eq.${vehicleUuid}&bot_id=eq.${BOT_ID}&limit=1`
+  );
+  return Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
+}
+
+async function supabasePost(tabela, body, onConflict) {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return false;
+  return new Promise((resolve) => {
+    const qs   = onConflict ? `?on_conflict=${onConflict}` : '';
+    const data = JSON.stringify(body);
+    const url  = new URL(`${SUPABASE_URL}/rest/v1/${tabela}${qs}`);
+    const options = {
+      hostname: url.hostname,
+      path:     url.pathname + url.search,
+      method:   'POST',
+      headers: {
+        'apikey':          SUPABASE_ANON_KEY,
+        'Authorization':   `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type':    'application/json',
+        'Content-Length':  Buffer.byteLength(data),
+        'Prefer':          'resolution=merge-duplicates,return=minimal',
+      },
+    };
+    const req = https.request(options, (res) => {
+      let raw = ''; res.on('data', c => raw += c); res.on('end', () => resolve(true));
+    });
+    req.on('error', () => resolve(false));
+    req.write(data);
+    req.end();
+  });
+}
+
+async function getFotosPorSessao(sessao) {
+  const nomes = Array.isArray(sessao.fotos) ? sessao.fotos : [];
+  if (nomes.length === 0) return [];
+
+  if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
+  const prefixo = `sess_${sessao.id}_`;
+  for (const f of fs.readdirSync(TEMP_DIR)) {
+    if (f.startsWith(prefixo)) try { fs.unlinkSync(path.join(TEMP_DIR, f)); } catch {}
+  }
+
+  const caminhos = [];
+  for (const nome of nomes) {
+    const destino = path.join(TEMP_DIR, `${prefixo}${nome}`);
+    const ok = await baixarFoto(sessao.id, nome, destino);
+    if (ok) caminhos.push({ nome, caminho: destino });
+  }
+
+  if (caminhos.length === 0) return [];
+
+  // Capa definida no CRM vai primeiro
+  if (sessao.capa) {
+    const idx = caminhos.findIndex(f => f.nome === sessao.capa);
+    if (idx > 0) {
+      const [capa] = caminhos.splice(idx, 1);
+      caminhos.unshift(capa);
+    }
+  }
+
+  return caminhos.map(f => f.caminho).slice(0, 20);
+}
+
+function limparTempSessao(sessaoId) {
+  if (!fs.existsSync(TEMP_DIR)) return;
+  const prefixo = `sess_${sessaoId}_`;
+  for (const f of fs.readdirSync(TEMP_DIR)) {
+    if (f.startsWith(prefixo)) try { fs.unlinkSync(path.join(TEMP_DIR, f)); } catch {}
+  }
+}
+
 async function buscarProximoComando() {
   const filtro = BOT_ID
     ? `bot_commands?bot_id=eq.${BOT_ID}&status=eq.pendente&order=created_at.asc&limit=1`
@@ -599,12 +682,45 @@ async function selecionarGrupos(page, max = 20) {
 
 // ── LÓGICA DE POSTAGEM (extraída para reutilizar no daemon) ───────────────────
 async function postarVeiculo(page, v) {
-  const { fotos, proximoIndice, fonte } = await getFotosVeiculo(v.id, v.pastaFotos || '', v.fotoCapaIndex || 0, v.uuid || null, v.fotosCapas || []);
-  if (fotos.length === 0) {
-    throw new Error(`Nenhuma foto encontrada para ${v.id} — faça upload no CRM ou na pasta local`);
+  let fotos         = [];
+  let usouSessao    = false;
+  let proximoIndice = 0;   // usado só no fallback antigo
+  let offsetRow     = null;
+  let sessaoUsada   = null;
+
+  // ── Tenta sessões de rotação (novo sistema) ──────────────────────────────
+  if (v.uuid && SUPABASE_URL && SUPABASE_ANON_KEY) {
+    const sessoes = await buscarSessoesVeiculo(v.uuid);
+    if (sessoes.length > 0) {
+      offsetRow           = await buscarOffsetBot(v.uuid);
+      const offsetInicial = offsetRow ? offsetRow.offset_inicial  : 0;
+      const postagens     = offsetRow ? offsetRow.postagens_count : 0;
+      const sessaoIndex   = (offsetInicial + postagens) % sessoes.length;
+      sessaoUsada         = sessoes[sessaoIndex];
+
+      log.info(`[Sessão] ${sessoes.length} sessão(ões) | offset: ${offsetInicial} | postagens: ${postagens} → sessão ${sessaoIndex} ("${sessaoUsada.nome}")`);
+
+      fotos = await getFotosPorSessao(sessaoUsada);
+      if (fotos.length > 0) {
+        usouSessao = true;
+        log.ok(`[Sessão] ${fotos.length} foto(s) — capa: ${path.basename(fotos[0])}`);
+      } else {
+        log.warn(`[Sessão] Sessão "${sessaoUsada.nome}" sem fotos no Storage — usando fallback`);
+      }
+    }
   }
-  const capasInfo = (v.fotosCapas || []).length > 0 ? ` | capas definidas: [${v.fotosCapas.join(', ')}]` : '';
-  log.info(`Fotos: ${fotos.length} encontrada(s) [${fonte}] — capa: ${path.basename(fotos[0])}${capasInfo}`);
+
+  // ── Fallback: lógica anterior (pasta local / Storage flat) ───────────────
+  if (!usouSessao) {
+    const resultado = await getFotosVeiculo(v.id, v.pastaFotos || '', v.fotoCapaIndex || 0, v.uuid || null, v.fotosCapas || []);
+    fotos           = resultado.fotos;
+    proximoIndice   = resultado.proximoIndice;
+    if (fotos.length > 0) log.info(`Fotos: ${fotos.length} encontrada(s) [${resultado.fonte}] — capa: ${path.basename(fotos[0])}`);
+  }
+
+  if (fotos.length === 0) {
+    throw new Error(`Nenhuma foto encontrada para ${v.id} — configure sessões no CRM ou adicione fotos na pasta local`);
+  }
 
   log.info('Gerando descrição...');
   const descricao = await gerarDescricao(v);
@@ -703,11 +819,37 @@ async function postarVeiculo(page, v) {
 
       await supabasePatch(`veiculos?local_id=eq.${v.id}`, {
         ultima_postagem: new Date().toISOString(),
-        foto_capa_index: proximoIndice,
         updated_at:      new Date().toISOString(),
       });
-      log.ok(`Supabase atualizado — ultimaPostagem registrada, próxima capa: índice ${proximoIndice}`);
-      limparTempVeiculo(v.id);
+
+      if (usouSessao && v.uuid) {
+        const novoCount = (offsetRow ? offsetRow.postagens_count : 0) + 1;
+        if (offsetRow) {
+          await supabasePatch(`fotos_offsets?id=eq.${offsetRow.id}`, {
+            postagens_count: novoCount,
+            updated_at:      new Date().toISOString(),
+          });
+        } else {
+          await supabasePost('fotos_offsets', {
+            veiculo_id:      v.uuid,
+            bot_id:          BOT_ID,
+            offset_inicial:  0,
+            postagens_count: 1,
+          }, 'veiculo_id,bot_id');
+        }
+        const totalSessoes = (await buscarSessoesVeiculo(v.uuid)).length;
+        const offsetInicial = offsetRow ? offsetRow.offset_inicial : 0;
+        const proximaSessao = (offsetInicial + novoCount) % totalSessoes;
+        log.ok(`[Sessão] postagens_count → ${novoCount} | próxima: sessão ${proximaSessao}`);
+        if (sessaoUsada) limparTempSessao(sessaoUsada.id);
+      } else {
+        await supabasePatch(`veiculos?local_id=eq.${v.id}`, {
+          foto_capa_index: proximoIndice,
+          updated_at:      new Date().toISOString(),
+        });
+        log.ok(`Supabase atualizado — ultimaPostagem registrada, próxima capa: índice ${proximoIndice}`);
+        limparTempVeiculo(v.id);
+      }
     } else {
       log.warn('Botão "Publicar" não encontrado. Clique manualmente no Chrome.');
       limparTempVeiculo(v.id);
