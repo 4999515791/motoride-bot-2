@@ -950,10 +950,15 @@ async function enviarMidiaVeiculo(page, veiculo, convId) {
 
           if (tamanho > LIMITE_VIDEO_BYTES) {
             log.info(`[Mídia] Vídeo grande (${(tamanho / 1024 / 1024).toFixed(1)} MB) — comprimindo com ffmpeg...`);
-            await comprimirVideo(destOriginal, destFinal, 19);
-            const tamanhoComprimido = fs.existsSync(destFinal) ? fs.statSync(destFinal).size : 0;
-            log.info(`[Mídia] Comprimido: ${(tamanhoComprimido / 1024 / 1024).toFixed(1)} MB`);
-            paraEnviar = destFinal;
+            try {
+              await comprimirVideo(destOriginal, destFinal, 19);
+              const tamanhoComprimido = fs.existsSync(destFinal) ? fs.statSync(destFinal).size : 0;
+              log.info(`[Mídia] Comprimido: ${(tamanhoComprimido / 1024 / 1024).toFixed(1)} MB`);
+              paraEnviar = destFinal;
+            } catch (ffErr) {
+              log.warn(`[Mídia] ffmpeg indisponível (${ffErr.message.slice(0, 60)}) — enviando original direto`);
+              paraEnviar = destOriginal; // tenta enviar mesmo sem comprimir (limite FB = 25 MB)
+            }
           } else if (ext !== 'mp4') {
             // Abaixo do limite mas formato não-mp4 (.mov, .avi etc)
             // Tenta converter com ffmpeg; se não estiver instalado, envia o original direto
