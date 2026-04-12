@@ -750,6 +750,8 @@ async function enviarArquivo(page, caminhoLocal) {
 }
 
 // ── Envia mídia do veículo no primeiro contato (fallback silencioso) ──────────
+const LIMITE_VIDEO_BYTES = 25 * 1024 * 1024; // 25 MB — limite do Facebook Messenger
+
 async function enviarMidiaVeiculo(page, veiculo, convId) {
   if (!veiculo || (!veiculo.audio_url && !veiculo.video_url)) return;
   if (!fs.existsSync(TEMP_MIDIA)) fs.mkdirSync(TEMP_MIDIA, { recursive: true });
@@ -759,52 +761,67 @@ async function enviarMidiaVeiculo(page, veiculo, convId) {
     try {
       const ext  = (veiculo.audio_url.split('.').pop().split('?')[0] || 'ogg').slice(0, 4);
       const dest = path.join(TEMP_MIDIA, `${convId}_audio.${ext}`);
-      log.info(`[Mídia] Baixando áudio do veículo...`);
+      log.info(`[Mídia] Baixando áudio: ${veiculo.audio_url}`);
       const baixou = await baixarMidia(veiculo.audio_url, dest);
-      const tamanhoAudio = baixou && fs.existsSync(dest) ? fs.statSync(dest).size : 0;
-      log.info(`[Mídia] Áudio baixado: ${tamanhoAudio} bytes`);
-      if (baixou && tamanhoAudio > 1000) {
+      log.info(`[Mídia] baixarMidia() retornou: ${baixou} | arquivo existe: ${fs.existsSync(dest)}`);
+      const tamanhoAudio = fs.existsSync(dest) ? fs.statSync(dest).size : 0;
+      log.info(`[Mídia] Áudio baixado: ${tamanhoAudio} bytes | ext: ${ext} | dest: ${dest}`);
+      if (!baixou) {
+        log.warn(`[Mídia] Falha no download do áudio (baixou=false)`);
+        try { fs.unlinkSync(dest); } catch {}
+      } else if (tamanhoAudio <= 1000) {
+        log.warn(`[Mídia] Áudio muito pequeno ou vazio: ${tamanhoAudio} bytes — possivelmente URL inválida ou bucket bloqueado`);
+        try { fs.unlinkSync(dest); } catch {}
+      } else {
+        log.info(`[Mídia] Chamando enviarArquivo() para áudio...`);
         const enviou = await enviarArquivo(page, dest);
         if (enviou) {
           log.ok(`[Mídia] Áudio enviado para ${convId}`);
           await delayAleatorio();
         } else {
-          log.warn(`[Mídia] Falha ao enviar áudio — continuando atendimento`);
+          log.warn(`[Mídia] enviarArquivo() retornou false para áudio — input[type=file] não encontrado ou setInputFiles falhou`);
         }
-        try { fs.unlinkSync(dest); } catch {}
-      } else {
-        log.warn(`[Mídia] Áudio vazio ou falha no download (${tamanhoAudio} bytes) — continuando atendimento`);
         try { fs.unlinkSync(dest); } catch {}
       }
     } catch (e) {
-      log.warn(`[Mídia] Erro no áudio: ${e.message} — continuando atendimento`);
+      log.warn(`[Mídia] Exceção no áudio: ${e.message}\n${e.stack}`);
     }
   }
 
-  // Vídeo (ativo depois do Pro Supabase)
+  // Vídeo — verifica tamanho (limite 25 MB) e renomeia .mov → .mp4
   if (veiculo.video_url) {
     try {
-      const ext  = (veiculo.video_url.split('.').pop().split('?')[0] || 'mp4').slice(0, 4);
-      const dest = path.join(TEMP_MIDIA, `${convId}_video.${ext}`);
-      log.info(`[Mídia] Baixando vídeo do veículo...`);
+      let ext  = (veiculo.video_url.split('.').pop().split('?')[0] || 'mp4').slice(0, 4).toLowerCase();
+      // .mov não é aceito pelo Messenger — renomeia para .mp4 (mesmo container H.264)
+      const extFinal = ext === 'mov' ? 'mp4' : ext;
+      const dest = path.join(TEMP_MIDIA, `${convId}_video.${extFinal}`);
+      log.info(`[Mídia] Baixando vídeo: ${veiculo.video_url} | ext original: ${ext} → salvo como .${extFinal}`);
       const baixou = await baixarMidia(veiculo.video_url, dest);
-      const tamanhoVideo = baixou && fs.existsSync(dest) ? fs.statSync(dest).size : 0;
-      log.info(`[Mídia] Vídeo baixado: ${tamanhoVideo} bytes`);
-      if (baixou && tamanhoVideo > 10000) {
+      log.info(`[Mídia] baixarMidia() retornou: ${baixou} | arquivo existe: ${fs.existsSync(dest)}`);
+      const tamanhoVideo = fs.existsSync(dest) ? fs.statSync(dest).size : 0;
+      log.info(`[Mídia] Vídeo baixado: ${tamanhoVideo} bytes (${(tamanhoVideo / 1024 / 1024).toFixed(1)} MB)`);
+      if (!baixou) {
+        log.warn(`[Mídia] Falha no download do vídeo (baixou=false)`);
+        try { fs.unlinkSync(dest); } catch {}
+      } else if (tamanhoVideo <= 10000) {
+        log.warn(`[Mídia] Vídeo muito pequeno ou vazio: ${tamanhoVideo} bytes`);
+        try { fs.unlinkSync(dest); } catch {}
+      } else if (tamanhoVideo > LIMITE_VIDEO_BYTES) {
+        log.warn(`[Mídia] Vídeo excede limite de 25 MB (${(tamanhoVideo / 1024 / 1024).toFixed(1)} MB) — não enviado`);
+        try { fs.unlinkSync(dest); } catch {}
+      } else {
+        log.info(`[Mídia] Chamando enviarArquivo() para vídeo...`);
         const enviou = await enviarArquivo(page, dest);
         if (enviou) {
           log.ok(`[Mídia] Vídeo enviado para ${convId}`);
           await delayAleatorio();
         } else {
-          log.warn(`[Mídia] Falha ao enviar vídeo — continuando atendimento`);
+          log.warn(`[Mídia] enviarArquivo() retornou false para vídeo`);
         }
-        try { fs.unlinkSync(dest); } catch {}
-      } else {
-        log.warn(`[Mídia] Vídeo vazio ou falha no download (${tamanhoVideo} bytes) — continuando atendimento`);
         try { fs.unlinkSync(dest); } catch {}
       }
     } catch (e) {
-      log.warn(`[Mídia] Erro no vídeo: ${e.message} — continuando atendimento`);
+      log.warn(`[Mídia] Exceção no vídeo: ${e.message}\n${e.stack}`);
     }
   }
 }
