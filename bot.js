@@ -6,6 +6,7 @@ const fs   = require('fs');
 const path = require('path');
 const log  = require('./modules/logger');
 const https = require('https');
+const { execFile } = require('child_process');
 
 // ── Config ───────────────────────────────────────────────
 const DRY_RUN      = process.env.DRY_RUN === 'true';
@@ -749,8 +750,58 @@ async function enviarArquivo(page, caminhoLocal) {
   }
 }
 
+// ── Comprime vídeo com ffmpeg para caber no limite do Messenger ───────────────
+const LIMITE_VIDEO_BYTES = 20 * 1024 * 1024; // 20 MB — margem de segurança (limite FB = 25 MB)
+
+async function comprimirVideo(inputPath, outputPath, targetMB = 20) {
+  // Passo 1: pega duração via ffprobe
+  const duration = await new Promise((resolve, reject) => {
+    execFile('ffprobe', [
+      '-v', 'quiet',
+      '-print_format', 'json',
+      '-show_streams',
+      inputPath,
+    ], (err, stdout) => {
+      if (err) return reject(new Error(`ffprobe falhou: ${err.message}`));
+      try {
+        const data = JSON.parse(stdout);
+        const stream = data.streams.find(s => s.codec_type === 'video') || data.streams[0];
+        const dur = parseFloat(stream.duration);
+        if (!dur || isNaN(dur)) return reject(new Error('ffprobe: duração não encontrada'));
+        resolve(dur);
+      } catch (e) {
+        reject(new Error(`ffprobe parse: ${e.message}`));
+      }
+    });
+  });
+
+  // Passo 2: calcula bitrate de vídeo para atingir targetMB
+  const targetBits    = targetMB * 1024 * 1024 * 8;
+  const audioBits     = 96 * 1000 * duration;            // 96 kbps áudio
+  const videoBitrate  = Math.max(100, Math.floor((targetBits - audioBits) / duration / 1000)); // kbps
+
+  log.info(`[ffmpeg] duração: ${duration.toFixed(1)}s | bitrate alvo: ${videoBitrate}k | saída: ${path.basename(outputPath)}`);
+
+  // Passo 3: comprime — single-pass, H.264 + AAC
+  return new Promise((resolve, reject) => {
+    execFile('ffmpeg', [
+      '-i', inputPath,
+      '-c:v', 'libx264',
+      '-b:v', `${videoBitrate}k`,
+      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', // garante dimensões pares (exigência H.264)
+      '-c:a', 'aac',
+      '-b:a', '96k',
+      '-movflags', '+faststart',                   // streaming-friendly
+      '-y',                                        // sobrescreve sem perguntar
+      outputPath,
+    ], { timeout: 5 * 60 * 1000 }, (err, _stdout, stderr) => {
+      if (err) return reject(new Error(`ffmpeg falhou: ${err.message}\n${stderr?.slice(-300)}`));
+      resolve();
+    });
+  });
+}
+
 // ── Envia mídia do veículo no primeiro contato (fallback silencioso) ──────────
-const LIMITE_VIDEO_BYTES = 25 * 1024 * 1024; // 25 MB — limite do Facebook Messenger
 
 async function enviarMidiaVeiculo(page, veiculo, convId) {
   if (!veiculo || (!veiculo.audio_url && !veiculo.video_url)) return;
@@ -788,40 +839,58 @@ async function enviarMidiaVeiculo(page, veiculo, convId) {
     }
   }
 
-  // Vídeo — verifica tamanho (limite 25 MB) e renomeia .mov → .mp4
+  // Vídeo — baixa, comprime se necessário com ffmpeg, envia
   if (veiculo.video_url) {
+    let destOriginal = null;
+    let destFinal    = null;
     try {
-      let ext  = (veiculo.video_url.split('.').pop().split('?')[0] || 'mp4').slice(0, 4).toLowerCase();
-      // .mov não é aceito pelo Messenger — renomeia para .mp4 (mesmo container H.264)
-      const extFinal = ext === 'mov' ? 'mp4' : ext;
-      const dest = path.join(TEMP_MIDIA, `${convId}_video.${extFinal}`);
-      log.info(`[Mídia] Baixando vídeo: ${veiculo.video_url} | ext original: ${ext} → salvo como .${extFinal}`);
-      const baixou = await baixarMidia(veiculo.video_url, dest);
-      log.info(`[Mídia] baixarMidia() retornou: ${baixou} | arquivo existe: ${fs.existsSync(dest)}`);
-      const tamanhoVideo = fs.existsSync(dest) ? fs.statSync(dest).size : 0;
-      log.info(`[Mídia] Vídeo baixado: ${tamanhoVideo} bytes (${(tamanhoVideo / 1024 / 1024).toFixed(1)} MB)`);
-      if (!baixou) {
-        log.warn(`[Mídia] Falha no download do vídeo (baixou=false)`);
-        try { fs.unlinkSync(dest); } catch {}
-      } else if (tamanhoVideo <= 10000) {
-        log.warn(`[Mídia] Vídeo muito pequeno ou vazio: ${tamanhoVideo} bytes`);
-        try { fs.unlinkSync(dest); } catch {}
-      } else if (tamanhoVideo > LIMITE_VIDEO_BYTES) {
-        log.warn(`[Mídia] Vídeo excede limite de 25 MB (${(tamanhoVideo / 1024 / 1024).toFixed(1)} MB) — não enviado`);
-        try { fs.unlinkSync(dest); } catch {}
+      const ext      = (veiculo.video_url.split('.').pop().split('?')[0] || 'mp4').slice(0, 4).toLowerCase();
+      destOriginal   = path.join(TEMP_MIDIA, `${convId}_video_orig.${ext}`);
+      destFinal      = path.join(TEMP_MIDIA, `${convId}_video.mp4`);
+
+      log.info(`[Mídia] Baixando vídeo: ${veiculo.video_url}`);
+      const baixou = await baixarMidia(veiculo.video_url, destOriginal);
+      log.info(`[Mídia] baixarMidia() retornou: ${baixou} | arquivo existe: ${fs.existsSync(destOriginal)}`);
+
+      if (!baixou || !fs.existsSync(destOriginal)) {
+        log.warn(`[Mídia] Falha no download do vídeo`);
       } else {
-        log.info(`[Mídia] Chamando enviarArquivo() para vídeo...`);
-        const enviou = await enviarArquivo(page, dest);
-        if (enviou) {
-          log.ok(`[Mídia] Vídeo enviado para ${convId}`);
-          await delayAleatorio();
+        const tamanho = fs.statSync(destOriginal).size;
+        log.info(`[Mídia] Vídeo baixado: ${(tamanho / 1024 / 1024).toFixed(1)} MB`);
+
+        if (tamanho <= 10000) {
+          log.warn(`[Mídia] Vídeo vazio ou corrompido: ${tamanho} bytes`);
         } else {
-          log.warn(`[Mídia] enviarArquivo() retornou false para vídeo`);
+          let paraEnviar = destOriginal;
+
+          if (tamanho > LIMITE_VIDEO_BYTES) {
+            log.info(`[Mídia] Vídeo grande (${(tamanho / 1024 / 1024).toFixed(1)} MB) — comprimindo com ffmpeg...`);
+            await comprimirVideo(destOriginal, destFinal, 19);
+            const tamanhoComprimido = fs.existsSync(destFinal) ? fs.statSync(destFinal).size : 0;
+            log.info(`[Mídia] Comprimido: ${(tamanhoComprimido / 1024 / 1024).toFixed(1)} MB`);
+            paraEnviar = destFinal;
+          } else if (ext !== 'mp4') {
+            // Abaixo do limite mas .mov/.avi etc — converte para .mp4
+            log.info(`[Mídia] Convertendo .${ext} → .mp4...`);
+            await comprimirVideo(destOriginal, destFinal, 20);
+            paraEnviar = destFinal;
+          }
+
+          log.info(`[Mídia] Chamando enviarArquivo() para vídeo...`);
+          const enviou = await enviarArquivo(page, paraEnviar);
+          if (enviou) {
+            log.ok(`[Mídia] Vídeo enviado para ${convId}`);
+            await delayAleatorio();
+          } else {
+            log.warn(`[Mídia] enviarArquivo() retornou false para vídeo`);
+          }
         }
-        try { fs.unlinkSync(dest); } catch {}
       }
     } catch (e) {
       log.warn(`[Mídia] Exceção no vídeo: ${e.message}\n${e.stack}`);
+    } finally {
+      try { if (destOriginal) fs.unlinkSync(destOriginal); } catch {}
+      try { if (destFinal)    fs.unlinkSync(destFinal);    } catch {}
     }
   }
 }
