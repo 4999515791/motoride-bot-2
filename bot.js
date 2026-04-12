@@ -879,19 +879,19 @@ async function comprimirVideo(inputPath, outputPath, targetMB = 20) {
 
 // ── Envia mídia do veículo no primeiro contato (fallback silencioso) ──────────
 
-async function enviarMidiaVeiculo(page, veiculo, convId) {
+async function enviarMidiaVeiculo(page, veiculo, convId, { pularAudio = false } = {}) {
   if (!veiculo || (!veiculo.audio_url && !veiculo.video_url)) {
     log.info(`[Mídia] Sem audio_url/video_url para ${veiculo?.id || convId} — pulando`);
     return { audioEnviado: false, videoEnviado: false };
   }
-  log.info(`[Mídia] Iniciando envio | audio: ${!!veiculo.audio_url} | video: ${!!veiculo.video_url}`);
+  log.info(`[Mídia] Iniciando envio | audio: ${pularAudio ? 'já enviado' : !!veiculo.audio_url} | video: ${!!veiculo.video_url}`);
   if (!fs.existsSync(TEMP_MIDIA)) fs.mkdirSync(TEMP_MIDIA, { recursive: true });
 
-  let audioEnviado = false;
+  let audioEnviado = pularAudio; // considera enviado se estamos pulando
   let videoEnviado = false;
 
   // Áudio
-  if (veiculo.audio_url) {
+  if (veiculo.audio_url && !pularAudio) {
     try {
       const ext  = (veiculo.audio_url.split('.').pop().split('?')[0] || 'ogg').slice(0, 4);
       const dest = path.join(TEMP_MIDIA, `${convId}_audio.${ext}`);
@@ -1237,15 +1237,25 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
     const ehPrimeiroContato = !lead.historico || lead.historico.length === 0;
     let audioEnviado = false;
     let videoEnviado = false;
-    if (ehPrimeiroContato && !lead.midiaEnviada && !foraDeEstoque && veiculo) {
+
+    // midiaCompleta = true quando ambos foram enviados (ou campo legado midiaEnviada=true sem rastro de vídeo pendente)
+    const midiaCompleta = (lead.midiaEnviada && lead.videoEnviada !== false) ||
+                          (lead.audioEnviada && lead.videoEnviada);
+    // Tenta enviar se: primeiro contato E mídia ainda não completa
+    if (ehPrimeiroContato && !midiaCompleta && !foraDeEstoque && veiculo) {
+      const pularAudio = !!lead.audioEnviada; // áudio já foi enviado num ciclo anterior
+      if (pularAudio) log.info(`[Mídia] Áudio já enviado — tentando apenas o vídeo`);
       try {
-        const resultadoMidia = await enviarMidiaVeiculo(page, veiculo, convId);
+        const resultadoMidia = await enviarMidiaVeiculo(page, veiculo, convId, { pularAudio });
         audioEnviado = resultadoMidia?.audioEnviado || false;
         videoEnviado = resultadoMidia?.videoEnviado || false;
       } catch (e) {
         log.warn(`[Mídia] Erro inesperado — texto será enviado normalmente: ${e.message}`);
       }
-      lead.midiaEnviada = true;
+      // Salva flags individuais para rastrear o que foi enviado
+      lead.audioEnviada = lead.audioEnviada || audioEnviado;
+      lead.videoEnviada = lead.videoEnviada || videoEnviado;
+      if (lead.audioEnviada && lead.videoEnviada) lead.midiaEnviada = true; // compatibilidade
       leads[convId] = lead;
       saveJSON(LEADS_FILE, leads);
     }
@@ -1254,7 +1264,8 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
     // • Áudio (com ou sem vídeo) → não envia texto (áudio já abre o atendimento)
     // • Só vídeo → envia texto junto (vídeo sozinho não substitui a saudação)
     // • Nada  → envia texto para o cliente não ficar sem resposta
-    const enviarTexto = !audioEnviado;
+    const audioJaEnviado = audioEnviado || !!lead.audioEnviada;
+    const enviarTexto = !audioJaEnviado;
     if (!enviarTexto) {
       log.info(`[${convId}] Áudio enviado — texto suprimido no primeiro contato`);
       // Registra a interação no histórico mesmo sem texto
