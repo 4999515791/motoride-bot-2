@@ -1172,14 +1172,20 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
   // Se a última mensagem da conversa (toda) é nossa → cliente ainda não respondeu
   // Exceção: se o sidebar marcou como "mensagem não lida" o cliente respondeu mas não foi detectado
   const ultimaGeral = todasMsgs[todasMsgs.length - 1];
-  if (ultimaGeral && ultimaGeral.de === 'eu' && !isUnread) {
-    log.info(`[${convId}] Última mensagem é nossa — aguardando cliente`);
-    return respostasNoCiclo;
-  }
 
   const fpAtual = fingerprint(ultima);
   const leads   = loadJSON(LEADS_FILE);
   const lead    = leads[convId] || { historico: [], fpRespondido: '' };
+
+  if (ultimaGeral && ultimaGeral.de === 'eu' && !isUnread) {
+    // Só faz early return se temos evidência real de que já respondemos
+    const temHistorico = !!(lead.fpRespondido || lead.midiaEnviada || lead.crmRegistrado || lead.ultimaEnvio);
+    if (temHistorico) {
+      log.info(`[${convId}] Última mensagem é nossa — aguardando cliente`);
+      return respostasNoCiclo;
+    }
+    log.info(`[${convId}] "Última msg nossa" mas sem histórico local — possível card do anúncio, continuando`);
+  }
 
   // Guarda de segurança extra: fpEnviado bate com última msg do cliente → não responder
   if (fpAtual === (lead.fpEnviado || '__NUNCA__')) {
