@@ -630,15 +630,33 @@ async function lerMensagensPopup(page) {
       if (!minha) clienteMsgs.push(txt);
     }
 
-    // ── Detecta mensagens de voz/áudio do cliente ───────────────────────────────
-    // Elementos de áudio não têm dir="auto", mas têm aria-label ou texto específico
+    // ── Detecta mensagens de voz/áudio DO CLIENTE ───────────────────────────────
+    // Usa a mesma lógica de detecção de "nossa mensagem" que o bloco de texto acima:
+    // percorre os elementos pai procurando aria-label ou CSS que indiquem mensagem enviada.
     const temAudio = Array.from(document.querySelectorAll(
       'audio, [aria-label*="mensagem de voz"], [aria-label*="voice message"], [aria-label*="Reproduzir"], [aria-label*="Play"]'
     )).some(el => {
       const rect = el.getBoundingClientRect();
       if (rect.top >= inputTop || rect.top <= 0) return false;
-      // Verifica se não é nossa mensagem (fica na direita)
-      return rect.left < window.innerWidth * 0.6;
+
+      // Percorre pais para detectar se é mensagem nossa (mesmo padrão das msgs de texto)
+      let n = el;
+      for (let i = 0; i < 15; i++) {
+        n = n?.parentElement;
+        if (!n || n.tagName === 'BODY') break;
+        const lbl = (n.getAttribute('aria-label') || '').toLowerCase();
+        if (lbl.startsWith('você:') || lbl.includes('enviada') || lbl.includes('você enviou')) {
+          return false; // é nossa mensagem — ignorar
+        }
+        const st = window.getComputedStyle(n);
+        if (st.marginLeft === 'auto' || st.alignSelf === 'flex-end' || st.justifyContent === 'flex-end') {
+          return false; // é nossa mensagem — ignorar
+        }
+      }
+      // Fallback posicional: se o play button está muito à direita, provavelmente é nosso
+      if (rect.left > window.innerWidth * 0.65) return false;
+
+      return true; // é áudio do cliente
     });
     // Adiciona [áudio] se: sem msgs de texto OU última msg do cliente foi há muito tempo (áudio mais recente)
     const ultimaClienteTxt = clienteMsgs[clienteMsgs.length - 1];
@@ -987,6 +1005,8 @@ async function detectarRows(page) {
       if (!vehicleKws.test(afterDot) && !/\b(19|20)\d{2}\b/.test(afterDot)) continue;
       const rect = el.getBoundingClientRect();
       if (rect.width < 150 || rect.height < 20 || rect.top < 80) continue;
+      // Garante que o elemento está no sidebar esquerdo — exclui o painel da conversa aberta
+      if (rect.left > 450) continue;
       const yKey = Math.round(rect.top / 20) * 20;
       if (seenY.has(yKey)) continue;
       seenY.add(yKey);
@@ -1449,6 +1469,8 @@ async function monitorar(page, context) {
     return (comprador + '_' + vStable).replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '_');
   };
 
+  let ultimaUrlProcessada = '';
+
   while (true) {
     const rows = await detectarRows(page);
     const proximo = rows.find(r => !processados.has(chaveRow(r)));
@@ -1470,6 +1492,14 @@ async function monitorar(page, context) {
       const convId = mId?.[1] || urlAtual.match(/\d{10,}/)?.[0] || chaveRow(proximo);
 
       log.info(`  URL: ${urlAtual.slice(-70)}`);
+
+      // Proteção contra clique fantasma: URL não mudou após o clique → sidebar não navegou
+      if (urlAtual === ultimaUrlProcessada) {
+        log.warn(`  [skip] URL igual à anterior — clique não navegou para nova conversa (row falsa do painel principal?)`);
+        continue;
+      }
+      ultimaUrlProcessada = urlAtual;
+
       respostasNoCiclo = await processarConversa(page, ativos, convId, proximo.vehicleHint, true, respostasNoCiclo, proximo.isUnread, proximo.text);
 
       // Delay humano entre conversas (sidebar permanece aberto)
