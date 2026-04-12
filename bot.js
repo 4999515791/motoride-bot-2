@@ -761,7 +761,9 @@ async function enviarMidiaVeiculo(page, veiculo, convId) {
       const dest = path.join(TEMP_MIDIA, `${convId}_audio.${ext}`);
       log.info(`[Mídia] Baixando áudio do veículo...`);
       const baixou = await baixarMidia(veiculo.audio_url, dest);
-      if (baixou) {
+      const tamanhoAudio = baixou && fs.existsSync(dest) ? fs.statSync(dest).size : 0;
+      log.info(`[Mídia] Áudio baixado: ${tamanhoAudio} bytes`);
+      if (baixou && tamanhoAudio > 1000) {
         const enviou = await enviarArquivo(page, dest);
         if (enviou) {
           log.ok(`[Mídia] Áudio enviado para ${convId}`);
@@ -771,7 +773,8 @@ async function enviarMidiaVeiculo(page, veiculo, convId) {
         }
         try { fs.unlinkSync(dest); } catch {}
       } else {
-        log.warn(`[Mídia] Falha ao baixar áudio — continuando atendimento`);
+        log.warn(`[Mídia] Áudio vazio ou falha no download (${tamanhoAudio} bytes) — continuando atendimento`);
+        try { fs.unlinkSync(dest); } catch {}
       }
     } catch (e) {
       log.warn(`[Mídia] Erro no áudio: ${e.message} — continuando atendimento`);
@@ -785,7 +788,9 @@ async function enviarMidiaVeiculo(page, veiculo, convId) {
       const dest = path.join(TEMP_MIDIA, `${convId}_video.${ext}`);
       log.info(`[Mídia] Baixando vídeo do veículo...`);
       const baixou = await baixarMidia(veiculo.video_url, dest);
-      if (baixou) {
+      const tamanhoVideo = baixou && fs.existsSync(dest) ? fs.statSync(dest).size : 0;
+      log.info(`[Mídia] Vídeo baixado: ${tamanhoVideo} bytes`);
+      if (baixou && tamanhoVideo > 10000) {
         const enviou = await enviarArquivo(page, dest);
         if (enviou) {
           log.ok(`[Mídia] Vídeo enviado para ${convId}`);
@@ -795,7 +800,8 @@ async function enviarMidiaVeiculo(page, veiculo, convId) {
         }
         try { fs.unlinkSync(dest); } catch {}
       } else {
-        log.warn(`[Mídia] Falha ao baixar vídeo — continuando atendimento`);
+        log.warn(`[Mídia] Vídeo vazio ou falha no download (${tamanhoVideo} bytes) — continuando atendimento`);
+        try { fs.unlinkSync(dest); } catch {}
       }
     } catch (e) {
       log.warn(`[Mídia] Erro no vídeo: ${e.message} — continuando atendimento`);
