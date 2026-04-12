@@ -937,10 +937,16 @@ async function enviarMidiaVeiculo(page, veiculo, convId) {
             log.info(`[Mídia] Comprimido: ${(tamanhoComprimido / 1024 / 1024).toFixed(1)} MB`);
             paraEnviar = destFinal;
           } else if (ext !== 'mp4') {
-            // Abaixo do limite mas .mov/.avi etc — converte para .mp4
+            // Abaixo do limite mas formato não-mp4 (.mov, .avi etc)
+            // Tenta converter com ffmpeg; se não estiver instalado, envia o original direto
             log.info(`[Mídia] Convertendo .${ext} → .mp4...`);
-            await comprimirVideo(destOriginal, destFinal, 20);
-            paraEnviar = destFinal;
+            try {
+              await comprimirVideo(destOriginal, destFinal, 20);
+              paraEnviar = destFinal;
+            } catch (ffErr) {
+              log.warn(`[Mídia] ffmpeg indisponível (${ffErr.message.slice(0, 60)}) — enviando .${ext} direto`);
+              paraEnviar = destOriginal; // tenta enviar o .mov/.avi original
+            }
           }
 
           log.info(`[Mídia] Chamando enviarArquivo() para vídeo...`);
