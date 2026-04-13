@@ -719,6 +719,7 @@ async function postarVeiculo(page, v) {
   }
 
   if (fotos.length === 0) {
+    log.error(`[Fotos] Nenhuma foto encontrada — id: ${v.id}, pastaFotos: "${v.pastaFotos}", uuid: ${v.uuid || '—'}`);
     throw new Error(`Nenhuma foto encontrada para ${v.id} — configure sessões no CRM ou adicione fotos na pasta local`);
   }
 
@@ -765,7 +766,8 @@ async function postarVeiculo(page, v) {
   await dropdown(page, 'Ano', String(v.ano));
   await page.waitForTimeout(2000);
 
-  await dropdown(page, 'Fabricante', v.marca);
+  const fabricanteOk = await dropdown(page, 'Fabricante', v.marca);
+  if (!fabricanteOk) throw new Error(`Dropdown "Fabricante" não encontrou "${v.marca}" — verifique se a marca está correta no Marketplace`);
   await page.waitForTimeout(4000);
 
   const modeloDigitar = v.modeloMkt || v.pastaFotos;
@@ -907,18 +909,30 @@ async function modoDaemon() {
     }
 
     const vehicleId = item.veiculo_id;
-    log.info(`[FILA] Próximo: ${vehicleId} (item: ${item.id})`);
+    log.info(`[FILA] Próximo: veiculo_id="${vehicleId}" (item: ${item.id})`);
     await marcarComandoExecutando(item.id);
 
     const vehicles = await carregarVeiculosSupabase();
-    const v = vehicles[vehicleId];
+    log.info(`[FILA] ${Object.keys(vehicles).length} veículo(s) no estoque: ${Object.keys(vehicles).slice(0, 15).join(', ')}`);
+    let v = vehicles[vehicleId];
     if (!v) {
-      log.error(`[FILA] Veículo "${vehicleId}" não encontrado no estoque`);
-      await marcarComandoErro(item.id, `Veículo ${vehicleId} não encontrado`);
-      continue;
+      log.warn(`[FILA] "${vehicleId}" não encontrado por chave direta — tentando alternativas...`);
+      const porUuid    = Object.values(vehicles).find(x => x.uuid === vehicleId);
+      log.info(`[FILA]   por uuid:       ${porUuid    ? `${porUuid.id} (${porUuid.marca} ${porUuid.modelo})`         : 'não encontrado'}`);
+      const porLocalId = Object.values(vehicles).find(x => x.id === vehicleId);
+      log.info(`[FILA]   por local_id:   ${porLocalId ? `${porLocalId.id} (${porLocalId.marca} ${porLocalId.modelo})` : 'não encontrado'}`);
+      const porPasta   = Object.values(vehicles).find(x => x.pastaFotos && x.pastaFotos.toLowerCase() === vehicleId.toLowerCase());
+      log.info(`[FILA]   por pastaFotos: ${porPasta   ? `${porPasta.id} (${porPasta.marca} ${porPasta.modelo})`       : 'não encontrado'}`);
+      v = porUuid || porLocalId || porPasta || null;
+      if (!v) {
+        log.error(`[FILA] Veículo "${vehicleId}" não encontrado — nenhuma das buscas retornou resultado`);
+        await marcarComandoErro(item.id, `Veículo ${vehicleId} não encontrado`);
+        continue;
+      }
+      log.ok(`[FILA] Encontrado via busca alternativa: ${v.id} (${v.marca} ${v.modelo})`);
     }
 
-    log.info(`=== Postando: ${v.marca} ${v.modelo} ${v.ano} ===`);
+    log.info(`=== Postando: ${v.marca} ${v.modelo} ${v.ano} (id=${v.id}, uuid=${v.uuid || '—'}) ===`);
     const page = await context.newPage();
     await page.setViewportSize({ width: 1280, height: 900 });
 

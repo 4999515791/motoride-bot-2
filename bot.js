@@ -6,7 +6,6 @@ const fs   = require('fs');
 const path = require('path');
 const log  = require('./modules/logger');
 const https = require('https');
-const { execFile } = require('child_process');
 
 // ── Config ───────────────────────────────────────────────
 const DRY_RUN      = process.env.DRY_RUN === 'true';
@@ -36,7 +35,7 @@ async function chamarEdgeFunction(nome, body) {
     log.warn(`[EdgeFn] ${nome} — SUPABASE_URL ou BOT_SECRET_TOKEN não definidos`);
     return null;
   }
-  return new Promise((resolve) => {
+  return comRetry(() => new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
     const url  = new URL(`${SUPABASE_URL}/functions/v1/${nome}`);
     const headers = {
@@ -67,32 +66,34 @@ async function chamarEdgeFunction(nome, body) {
     });
     req.on('error', (e) => {
       log.warn(`[EdgeFn] ${nome} — erro de rede: ${e.message}`);
-      resolve(null);
+      reject(e);
     });
     req.write(data);
     req.end();
-  });
+  })).catch(() => null);
 }
 
 // ── Telegram — notificações ──────────────────────────────
-function notificarTelegram(mensagem) {
+async function notificarTelegram(mensagem) {
   if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return;
-  const data = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: mensagem, parse_mode: 'HTML' });
-  const req = https.request({
-    hostname: 'api.telegram.org',
-    path: `/bot${TELEGRAM_TOKEN}/sendMessage`,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
-  }, (res) => { res.resume(); });
-  req.on('error', (e) => log.warn(`[Telegram] Falha ao notificar: ${e.message}`));
-  req.write(data);
-  req.end();
+  await comRetry(() => new Promise((resolve, reject) => {
+    const data = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: mensagem, parse_mode: 'HTML' });
+    const req = https.request({
+      hostname: 'api.telegram.org',
+      path: `/bot${TELEGRAM_TOKEN}/sendMessage`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+    }, (res) => { res.resume(); resolve(); });
+    req.on('error', (e) => { log.warn(`[Telegram] Falha ao notificar: ${e.message}`); reject(e); });
+    req.write(data);
+    req.end();
+  })).catch(e => log.warn(`[Telegram] Todas as tentativas falharam: ${e.message}`));
 }
 
 // ── Supabase REST API — POST/UPSERT ─────────────────────
 async function supabaseRestPost(tabela, body, upsertColuna) {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return null;
-  return new Promise((resolve) => {
+  return comRetry(() => new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
     const qs   = upsertColuna ? `?on_conflict=${upsertColuna}` : '';
     const url  = new URL(`${SUPABASE_URL}/rest/v1/${tabela}${qs}`);
@@ -117,16 +118,16 @@ async function supabaseRestPost(tabela, body, upsertColuna) {
         try { resolve(JSON.parse(raw)); } catch { resolve(null); }
       });
     });
-    req.on('error', (e) => { log.warn(`[REST POST] ${tabela} — erro: ${e.message}`); resolve(null); });
+    req.on('error', (e) => { log.warn(`[REST POST] ${tabela} — erro: ${e.message}`); reject(e); });
     req.write(data);
     req.end();
-  });
+  })).catch(() => null);
 }
 
 // ── Supabase REST API — veículos ─────────────────────────
 async function supabaseRestGet(caminho) {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return null;
-  return new Promise((resolve) => {
+  return comRetry(() => new Promise((resolve, reject) => {
     const url = new URL(`${SUPABASE_URL}/rest/v1/${caminho}`);
     const options = {
       hostname: url.hostname,
@@ -142,9 +143,9 @@ async function supabaseRestGet(caminho) {
       res.on('data', chunk => raw += chunk);
       res.on('end', () => { try { resolve(JSON.parse(raw)); } catch { resolve(null); } });
     });
-    req.on('error', () => resolve(null));
+    req.on('error', (e) => reject(e));
     req.end();
-  });
+  })).catch(() => null);
 }
 
 function mapearVeiculoSupabase(row) {
@@ -311,12 +312,34 @@ function saveJSON(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
 }
 
+// ── Estado global ────────────────────────────────────────
+let claudeCooldown = false;  // true durante 5min após erro 429 da Anthropic
+let ultimaLimpeza  = null;   // data da última limpeza do JSON local (item 4.4)
+
 // ── Utilitários ──────────────────────────────────────────
 
 // Delay aleatório entre DELAY_MIN e DELAY_MAX ms
 function delayAleatorio() {
   const ms = Math.floor(Math.random() * (DELAY_MAX - DELAY_MIN + 1)) + DELAY_MIN;
   return new Promise(r => setTimeout(r, ms));
+}
+
+// Retenta operações de rede com backoff exponencial: 2s / 4s / 8s
+async function comRetry(fn, tentativas = 3) {
+  const esperas = [2000, 4000, 8000];
+  let ultimoErro;
+  for (let i = 0; i < tentativas; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      ultimoErro = e;
+      if (i < tentativas - 1) {
+        log.warn(`[retry] Tentativa ${i + 1}/${tentativas} falhou: ${e.message.slice(0, 80)} — aguardando ${esperas[i] / 1000}s...`);
+        await new Promise(r => setTimeout(r, esperas[i]));
+      }
+    }
+  }
+  throw ultimoErro;
 }
 
 // Fingerprint normalizado: ignora maiúsculas, espaços extras, pontuação irrelevante
@@ -434,12 +457,26 @@ INSTRUÇÃO PARA ESTA MENSAGEM: ${instrucao}`;
   const msgs = hist.slice(-12).map(m => ({ role: m.de === 'eu' ? 'assistant' : 'user', content: m.texto }));
   msgs.push({ role: 'user', content: mensagem });
 
-  const res = await claude.messages.create({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 150,
-    system,
-    messages: msgs
+  if (claudeCooldown) {
+    log.warn('[Claude] Cooldown de rate limit ativo — pulando resposta');
+    return null;
+  }
+  const res = await comRetry(async () => {
+    try {
+      return await claude.messages.create({ model: 'claude-haiku-4-5-20251001', max_tokens: 150, system, messages: msgs });
+    } catch (e) {
+      if (e?.status === 429 || /rate.?limit|overloaded/i.test(e?.message || '')) {
+        log.warn('[Claude] Rate limit (429) — ativando cooldown de 5 minutos...');
+        if (!claudeCooldown) {
+          claudeCooldown = true;
+          setTimeout(() => { claudeCooldown = false; log.info('[Claude] Cooldown encerrado'); }, 5 * 60 * 1000);
+        }
+        return null;
+      }
+      throw e;
+    }
   });
+  if (!res) return null;
   let resposta = res.content[0].text.trim()
     .replace(/\*\*/g, '').replace(/\*/g, '')
     .replace(/[🏍🚗🚙🏎🤝👍👋🔥💪✅📱🙌]/gu, '')
@@ -494,21 +531,38 @@ async function gerarFollowUp(veiculo, historico) {
     .join('\n');
 
   const vendedor = { facebook1: 'Jhow', facebook2: 'João', facebook3: 'Lucas', facebook4: 'Bruna' }[BOT_ID] || 'João';
-  const res = await claude.messages.create({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 50,
-    messages: [{
-      role: 'user',
-      content: `Você é ${vendedor}, vendedor da MotoRide. Veículo: ${v.marca} ${v.modeloMkt || v.modelo} ${v.ano}, R$${Number(v.preco).toLocaleString('pt-BR')}.
+  if (claudeCooldown) {
+    log.warn('[Claude] Cooldown de rate limit ativo — usando follow-up padrão');
+    return `Oi! O ${v.marca} ${v.modeloMkt || v.modelo} ainda está disponível. Ainda tem interesse?`;
+  }
+  const conteudoPrompt = `Você é ${vendedor}, vendedor da MotoRide. Veículo: ${v.marca} ${v.modeloMkt || v.modelo} ${v.ano}, R$${Number(v.preco).toLocaleString('pt-BR')}.
 
 O cliente sumiu. Escreva 1 frase curta e natural de follow-up, sem emoji, sem pressão. Se mencionar contato, APENAS peça o WhatsApp do cliente — NUNCA mencione nosso número de telefone nem links. Português informal.
 
 Conversa:
 ${conversa}
 
-Follow-up (1 frase apenas):`
-    }]
+Follow-up (1 frase apenas):`;
+  const res = await comRetry(async () => {
+    try {
+      return await claude.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 50,
+        messages: [{ role: 'user', content: conteudoPrompt }]
+      });
+    } catch (e) {
+      if (e?.status === 429 || /rate.?limit|overloaded/i.test(e?.message || '')) {
+        log.warn('[Claude] Rate limit (429) — ativando cooldown de 5 minutos...');
+        if (!claudeCooldown) {
+          claudeCooldown = true;
+          setTimeout(() => { claudeCooldown = false; log.info('[Claude] Cooldown encerrado'); }, 5 * 60 * 1000);
+        }
+        return null;
+      }
+      throw e;
+    }
   });
+  if (!res) return `Oi! O ${v.marca} ${v.modeloMkt || v.modelo} ainda está disponível. Ainda tem interesse?`;
   let followUpText = res.content[0].text.trim()
     .replace(/\*\*/g, '').replace(/\*/g, '')
     .replace(/[🏍🚗🚙🏎🤝👍👋🔥💪✅📱]/gu, '')
@@ -645,7 +699,7 @@ async function lerMensagensPopup(page) {
         n = n?.parentElement;
         if (!n || n.tagName === 'BODY') break;
         const lbl = (n.getAttribute('aria-label') || '').toLowerCase();
-        if (lbl.startsWith('você:') || lbl.includes('enviada') || lbl.includes('você enviou')) {
+        if (lbl.startsWith('você:') || lbl.includes('enviada') || lbl.includes('você enviou') || lbl.includes('sent')) {
           return false; // é nossa mensagem — ignorar
         }
         const st = window.getComputedStyle(n);
@@ -654,7 +708,7 @@ async function lerMensagensPopup(page) {
         }
       }
       // Fallback posicional: se o play button está muito à direita, provavelmente é nosso
-      if (rect.left > window.innerWidth * 0.65) return false;
+      if (rect.left > window.innerWidth * 0.70) return false;
 
       return true; // é áudio do cliente
     });
@@ -826,56 +880,6 @@ async function enviarArquivo(page, caminhoLocal) {
   }
 }
 
-// ── Comprime vídeo com ffmpeg para caber no limite do Messenger ───────────────
-const LIMITE_VIDEO_BYTES = 20 * 1024 * 1024; // 20 MB — margem de segurança (limite FB = 25 MB)
-
-async function comprimirVideo(inputPath, outputPath, targetMB = 20) {
-  // Passo 1: pega duração via ffprobe
-  const duration = await new Promise((resolve, reject) => {
-    execFile('ffprobe', [
-      '-v', 'quiet',
-      '-print_format', 'json',
-      '-show_streams',
-      inputPath,
-    ], (err, stdout) => {
-      if (err) return reject(new Error(`ffprobe falhou: ${err.message}`));
-      try {
-        const data = JSON.parse(stdout);
-        const stream = data.streams.find(s => s.codec_type === 'video') || data.streams[0];
-        const dur = parseFloat(stream.duration);
-        if (!dur || isNaN(dur)) return reject(new Error('ffprobe: duração não encontrada'));
-        resolve(dur);
-      } catch (e) {
-        reject(new Error(`ffprobe parse: ${e.message}`));
-      }
-    });
-  });
-
-  // Passo 2: calcula bitrate de vídeo para atingir targetMB
-  const targetBits    = targetMB * 1024 * 1024 * 8;
-  const audioBits     = 96 * 1000 * duration;            // 96 kbps áudio
-  const videoBitrate  = Math.max(100, Math.floor((targetBits - audioBits) / duration / 1000)); // kbps
-
-  log.info(`[ffmpeg] duração: ${duration.toFixed(1)}s | bitrate alvo: ${videoBitrate}k | saída: ${path.basename(outputPath)}`);
-
-  // Passo 3: comprime — single-pass, H.264 + AAC
-  return new Promise((resolve, reject) => {
-    execFile('ffmpeg', [
-      '-i', inputPath,
-      '-c:v', 'libx264',
-      '-b:v', `${videoBitrate}k`,
-      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', // garante dimensões pares (exigência H.264)
-      '-c:a', 'aac',
-      '-b:a', '96k',
-      '-movflags', '+faststart',                   // streaming-friendly
-      '-y',                                        // sobrescreve sem perguntar
-      outputPath,
-    ], { timeout: 5 * 60 * 1000 }, (err, _stdout, stderr) => {
-      if (err) return reject(new Error(`ffmpeg falhou: ${err.message}\n${stderr?.slice(-300)}`));
-      resolve();
-    });
-  });
-}
 
 // ── Envia mídia do veículo no primeiro contato (fallback silencioso) ──────────
 
@@ -924,14 +928,12 @@ async function enviarMidiaVeiculo(page, veiculo, convId, { pularAudio = false } 
     }
   }
 
-  // Vídeo — baixa, comprime se necessário com ffmpeg, envia
+  // Vídeo — baixa e envia diretamente (vídeo já chega pré-comprimido)
   if (veiculo.video_url) {
     let destOriginal = null;
-    let destFinal    = null;
     try {
       const ext      = (veiculo.video_url.split('.').pop().split('?')[0] || 'mp4').slice(0, 4).toLowerCase();
       destOriginal   = path.join(TEMP_MIDIA, `${convId}_video_orig.${ext}`);
-      destFinal      = path.join(TEMP_MIDIA, `${convId}_video.mp4`);
 
       log.info(`[Mídia] Baixando vídeo: ${veiculo.video_url}`);
       const baixou = await baixarMidia(veiculo.video_url, destOriginal);
@@ -946,34 +948,8 @@ async function enviarMidiaVeiculo(page, veiculo, convId, { pularAudio = false } 
         if (tamanho <= 10000) {
           log.warn(`[Mídia] Vídeo vazio ou corrompido: ${tamanho} bytes`);
         } else {
-          let paraEnviar = destOriginal;
-
-          if (tamanho > LIMITE_VIDEO_BYTES) {
-            log.info(`[Mídia] Vídeo grande (${(tamanho / 1024 / 1024).toFixed(1)} MB) — comprimindo com ffmpeg...`);
-            try {
-              await comprimirVideo(destOriginal, destFinal, 19);
-              const tamanhoComprimido = fs.existsSync(destFinal) ? fs.statSync(destFinal).size : 0;
-              log.info(`[Mídia] Comprimido: ${(tamanhoComprimido / 1024 / 1024).toFixed(1)} MB`);
-              paraEnviar = destFinal;
-            } catch (ffErr) {
-              log.warn(`[Mídia] ffmpeg indisponível (${ffErr.message.slice(0, 60)}) — enviando original direto`);
-              paraEnviar = destOriginal; // tenta enviar mesmo sem comprimir (limite FB = 25 MB)
-            }
-          } else if (ext !== 'mp4') {
-            // Abaixo do limite mas formato não-mp4 (.mov, .avi etc)
-            // Tenta converter com ffmpeg; se não estiver instalado, envia o original direto
-            log.info(`[Mídia] Convertendo .${ext} → .mp4...`);
-            try {
-              await comprimirVideo(destOriginal, destFinal, 20);
-              paraEnviar = destFinal;
-            } catch (ffErr) {
-              log.warn(`[Mídia] ffmpeg indisponível (${ffErr.message.slice(0, 60)}) — enviando .${ext} direto`);
-              paraEnviar = destOriginal; // tenta enviar o .mov/.avi original
-            }
-          }
-
           log.info(`[Mídia] Chamando enviarArquivo() para vídeo...`);
-          const enviou = await enviarArquivo(page, paraEnviar);
+          const enviou = await enviarArquivo(page, destOriginal);
           if (enviou) {
             videoEnviado = true;
             log.ok(`[Mídia] Vídeo enviado para ${convId}`);
@@ -986,7 +962,6 @@ async function enviarMidiaVeiculo(page, veiculo, convId, { pularAudio = false } 
       log.warn(`[Mídia] Exceção no vídeo: ${e.message}\n${e.stack}`);
     } finally {
       try { if (destOriginal) fs.unlinkSync(destOriginal); } catch {}
-      try { if (destFinal)    fs.unlinkSync(destFinal);    } catch {}
     }
   }
 
@@ -1168,6 +1143,7 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
   }
   const ultima = clienteMsgs[clienteMsgs.length - 1] || null;
   log.info(`  [msgs] ${todasMsgs.length} total | cliente: ${clienteMsgs.length} | "${(ultima||'').slice(0,50)}"`);
+  if (clienteMsgs.includes('[áudio]')) log.info(`[${convId}] Áudio detectado — classificado como: cliente`);
 
   if (!ultima) {
     log.info(`[${convId}] Nenhuma mensagem do cliente visível`);
@@ -1234,41 +1210,65 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
     log.info(`[${foraDeEstoque ? 'fora de estoque' : veiculo.marca + ' ' + veiculo.modelo}] Conversa ${convId} | "${ultima.slice(0,60)}"`);
 
     // ── Envia áudio/vídeo no primeiro contato ──────────────────────────────────
+    // Usa APENAS ehPrimeiroContato (historico.length === 0) — nunca lead.audioEnviada.
+    // lead.audioEnviada foi removido da lógica de decisão: era a causa do travamento permanente.
     const ehPrimeiroContato = !lead.historico || lead.historico.length === 0;
     let audioEnviado = false;
     let videoEnviado = false;
 
-    // midiaCompleta = true quando ambos foram enviados (ou campo legado midiaEnviada=true sem rastro de vídeo pendente)
-    const midiaCompleta = (lead.midiaEnviada && lead.videoEnviada !== false) ||
-                          (lead.audioEnviada && lead.videoEnviada);
-    // Tenta enviar se: primeiro contato E mídia ainda não completa
-    if (ehPrimeiroContato && !midiaCompleta && !foraDeEstoque && veiculo) {
-      const pularAudio = !!lead.audioEnviada; // áudio já foi enviado num ciclo anterior
-      if (pularAudio) log.info(`[Mídia] Áudio já enviado — tentando apenas o vídeo`);
+    if (ehPrimeiroContato && !foraDeEstoque && veiculo) {
       try {
-        const resultadoMidia = await enviarMidiaVeiculo(page, veiculo, convId, { pularAudio });
+        const resultadoMidia = await enviarMidiaVeiculo(page, veiculo, convId, {});
         audioEnviado = resultadoMidia?.audioEnviado || false;
         videoEnviado = resultadoMidia?.videoEnviado || false;
       } catch (e) {
         log.warn(`[Mídia] Erro inesperado — texto será enviado normalmente: ${e.message}`);
       }
-      // Salva flags individuais para rastrear o que foi enviado
-      lead.audioEnviada = lead.audioEnviada || audioEnviado;
-      lead.videoEnviada = lead.videoEnviada || videoEnviado;
-      if (lead.audioEnviada && lead.videoEnviada) lead.midiaEnviada = true; // compatibilidade
-      leads[convId] = lead;
-      saveJSON(LEADS_FILE, leads);
     }
 
-    // ── Decide se envia texto com base no que foi enviado de mídia ─────────────
+    // ── Decide se envia texto com base no que foi enviado NESTE CICLO ──────────
     // • Áudio (com ou sem vídeo) → não envia texto (áudio já abre o atendimento)
-    // • Só vídeo → envia texto junto (vídeo sozinho não substitui a saudação)
-    // • Nada  → envia texto para o cliente não ficar sem resposta
-    const audioJaEnviado = audioEnviado || !!lead.audioEnviada;
-    const enviarTexto = !audioJaEnviado;
+    // • Só vídeo                 → envia texto junto (vídeo sozinho não substitui a saudação)
+    // • Nada                     → envia texto obrigatoriamente
+    const enviarTexto = !audioEnviado;
     if (!enviarTexto) {
       log.info(`[${convId}] Áudio enviado — texto suprimido no primeiro contato`);
-      // Registra a interação no histórico mesmo sem texto
+    }
+
+    let algumEnvioRealizado = false;
+
+    if (enviarTexto) {
+      const contexto = todasMsgs.slice(0, -1).slice(-10);
+      let resp;
+      if (foraDeEstoque) {
+        const telNaMsg = extrairWhatsApp(ultima);
+        resp = telNaMsg
+          ? `Obrigado pelo contato! O especialista vai te chamar no ${telNaMsg} para ver o que temos disponível que pode te atender.`
+          : responderForaDeEstoque(vehicleHint);
+      } else {
+        resp = await responder(veiculo, contexto, ultima);
+        if (!resp) return respostasNoCiclo; // resposta descartada pelo filtro de segurança
+      }
+      log.info(`  Resposta: "${resp}"`);
+      await delayAleatorio();
+      if (await enviar(page, resp)) {
+        lead.historico = [...(lead.historico||[]),
+          { de: 'cliente', texto: ultima },
+          { de: 'eu',      texto: resp }
+        ].slice(-20);
+        lead.fpRespondido    = fpAtual;
+        lead.fpEnviado       = fingerprint(resp);
+        lead.followUpEnviado = false;
+        lead.ultimaAtividade = new Date().toISOString();
+        lead.ultimaEnvio     = new Date().toISOString();
+        leads[convId] = lead;
+        saveJSON(LEADS_FILE, leads);
+        respostasNoCiclo++;
+        log.ok(`[${convId}] Enviado (${respostasNoCiclo}/${MAX_POR_CICLO} neste ciclo)`);
+        algumEnvioRealizado = true;
+      }
+    } else {
+      // Áudio enviado: registra no histórico sem texto de resposta
       lead.historico = [...(lead.historico || []), { de: 'cliente', texto: ultima }].slice(-20);
       lead.fpRespondido    = fpAtual;
       lead.followUpEnviado = false;
@@ -1277,109 +1277,79 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
       leads[convId] = lead;
       saveJSON(LEADS_FILE, leads);
       respostasNoCiclo++;
+      algumEnvioRealizado = true;
     }
 
-    if (!enviarTexto) return respostasNoCiclo;
+    // ── Sincroniza lead no CRM — executa após texto ou áudio enviado ───────────
+    // Registra desde o primeiro contato; atualiza quando o cliente manda o WhatsApp
+    if (algumEnvioRealizado && SUPABASE_URL && BOT_SECRET_TOKEN) {
+      const clienteTextosCRM = lead.historico.filter(m => m.de === 'cliente').map(m => m.texto).join(' ');
+      const tel = extrairWhatsApp(clienteTextosCRM); // apenas do cliente, não da loja
 
-    const contexto = todasMsgs.slice(0, -1).slice(-10);
-    let resp;
-    if (foraDeEstoque) {
-      const telNaMsg = extrairWhatsApp(ultima);
-      resp = telNaMsg
-        ? `Obrigado pelo contato! O especialista vai te chamar no ${telNaMsg} para ver o que temos disponível que pode te atender.`
-        : responderForaDeEstoque(vehicleHint);
-    } else {
-      resp = await responder(veiculo, contexto, ultima);
-      if (!resp) return respostasNoCiclo; // resposta descartada pelo filtro de segurança
-    }
-    log.info(`  Resposta: "${resp}"`);
-    await delayAleatorio();
-    if (await enviar(page, resp)) {
-      lead.historico = [...(lead.historico||[]),
-        { de: 'cliente', texto: ultima },
-        { de: 'eu',      texto: resp }
-      ].slice(-20);
-      lead.fpRespondido    = fpAtual;
-      lead.fpEnviado       = fingerprint(resp);
-      lead.followUpEnviado = false;
-      lead.ultimaAtividade = new Date().toISOString();
-      lead.ultimaEnvio     = new Date().toISOString();
-      leads[convId] = lead;
-      saveJSON(LEADS_FILE, leads);
-      respostasNoCiclo++;
-      log.ok(`[${convId}] Enviado (${respostasNoCiclo}/${MAX_POR_CICLO} neste ciclo)`);
+      const deveRegistrar = !lead.crmRegistrado;          // primeiro contato
+      const deveAtualizar = tel && !lead.crmTemTelefone;  // cliente mandou o número
 
-      // ── Sincroniza lead no CRM ─────────────────────────────────────────────
-      // Registra desde o primeiro contato; atualiza quando o cliente manda o WhatsApp
-      if (SUPABASE_URL && BOT_SECRET_TOKEN) {
-        const clienteTextosCRM = lead.historico.filter(m => m.de === 'cliente').map(m => m.texto).join(' ');
-        const tel = extrairWhatsApp(clienteTextosCRM); // apenas do cliente, não da loja
+      log.info(`[CRM] deveRegistrar=${deveRegistrar} deveAtualizar=${!!deveAtualizar} crmRegistrado=${!!lead.crmRegistrado} tel=${tel||'—'}`);
 
-        const deveRegistrar = !lead.crmRegistrado;          // primeiro contato
-        const deveAtualizar = tel && !lead.crmTemTelefone;  // cliente mandou o número
-
-        log.info(`[CRM] deveRegistrar=${deveRegistrar} deveAtualizar=${!!deveAtualizar} crmRegistrado=${!!lead.crmRegistrado} tel=${tel||'—'}`);
-
-        if (deveRegistrar || deveAtualizar) {
-          // Lê o nome do comprador: extrai da row (formato "Nome · Veículo") ou tenta DOM
-          const nomeDoRow = rowText
-            ? rowText.split(' · ')[0]
-                .replace(/^\(\d+\)\s*/, '')
-                .replace(/^(online\s+agora|active\s+now|ativo\s+agora|disponível)\s*/i, '')
-                .trim()
-            : '';
-          const compradorNome = (nomeDoRow.length > 1 && nomeDoRow.length < 60 && !/messenger|facebook|marketplace|conversas|notifica/i.test(nomeDoRow))
-            ? nomeDoRow
-            : await page.evaluate(() => {
-                const header = document.querySelector('[role="main"] h1, [data-testid="conversation-title"]');
-                if (header) {
-                  const txt = (header.textContent || '').trim();
-                  if (txt.length > 1 && txt.length < 60 && !/messenger|facebook|marketplace|conversas/i.test(txt)) return txt;
-                }
-                const t = document.title || '';
-                const parte = t.split('|')[0].split('·')[0].replace(/^\(\d+\)\s*/, '').trim();
-                if (parte.length > 1 && !/messenger|facebook|conversas/i.test(parte)) return parte;
-                return 'Lead Marketplace';
-              }).catch(() => 'Lead Marketplace');
-
-          log.info(`[CRM] ${deveAtualizar ? 'Atualizando' : 'Registrando'} lead: ${compradorNome}${tel ? ' tel:' + tel : ' (sem tel ainda)'}`);
-
-          // Notifica Telegram: novo lead OU lead acabou de mandar WhatsApp
-          const isNovoLead     = !deveAtualizar;
-          const chegouTelefone = deveAtualizar && tel && !lead.crmTemTelefone;
-          if (isNovoLead || chegouTelefone) {
-            const botNomes = { facebook1: 'Jhow', facebook2: 'João Moto Ride', facebook3: 'Lucas Moto Ride', facebook4: 'Bruna Moto Ride' };
-            const botNome  = botNomes[BOT_ID] || BOT_ID;
-            const veiculoLabel = veiculo ? `${veiculo.marca} ${veiculo.modelo} ${veiculo.ano}` : 'veículo desconhecido';
-            const linhasTel = tel ? `📞 <b>WhatsApp:</b> ${tel}` : `📭 Ainda sem telefone`;
-            const titulo = isNovoLead ? '🆕 Novo lead no Marketplace!' : '📱 Lead mandou WhatsApp!';
-            notificarTelegram(
-              `${titulo}\n👤 <b>${compradorNome}</b>\n🚗 ${veiculoLabel}\n${linhasTel}\n🤖 Bot: ${botNome}`
-            );
-          }
-
-          sincronizarLeadCRM(convId, compradorNome, veiculo, lead.historico, tel)
-            .then(id => {
-              if (id) {
-                // Relê leads do disco para evitar sobrescrever dados de outras conversas
-                const leadsAtual = loadJSON(LEADS_FILE);
-                const leadAtual  = leadsAtual[convId] || lead;
-                leadAtual.crmRegistrado  = true;
-                leadAtual.nome           = compradorNome;
-                leadAtual.vehicleLabel   = veiculo ? `${veiculo.marca} ${veiculo.modelo} ${veiculo.ano}` : null;
-                leadAtual.vehicleId      = veiculo?.id || null;
-                if (tel) leadAtual.crmTemTelefone = true;
-                leadAtual.crmLeadId = id;
-                leadsAtual[convId] = leadAtual;
-                saveJSON(LEADS_FILE, leadsAtual);
+      if (deveRegistrar || deveAtualizar) {
+        // Lê o nome do comprador: extrai da row (formato "Nome · Veículo") ou tenta DOM
+        const nomeDoRow = rowText
+          ? rowText.split(' · ')[0]
+              .replace(/^\(\d+\)\s*/, '')
+              .replace(/^(online\s+agora|active\s+now|ativo\s+agora|disponível)\s*/i, '')
+              .trim()
+          : '';
+        const compradorNome = (nomeDoRow.length > 1 && nomeDoRow.length < 60 && !/messenger|facebook|marketplace|conversas|notifica/i.test(nomeDoRow))
+          ? nomeDoRow
+          : await page.evaluate(() => {
+              const header = document.querySelector('[role="main"] h1, [data-testid="conversation-title"]');
+              if (header) {
+                const txt = (header.textContent || '').trim();
+                if (txt.length > 1 && txt.length < 60 && !/messenger|facebook|marketplace|conversas/i.test(txt)) return txt;
               }
-            })
-            .catch(e => log.error(`[CRM] ${e.message}`));
-        }
-      }
+              const t = document.title || '';
+              const parte = t.split('|')[0].split('·')[0].replace(/^\(\d+\)\s*/, '').trim();
+              if (parte.length > 1 && !/messenger|facebook|conversas/i.test(parte)) return parte;
+              return 'Lead Marketplace';
+            }).catch(() => 'Lead Marketplace');
 
-      await delayAleatorio();
+        log.info(`[CRM] ${deveAtualizar ? 'Atualizando' : 'Registrando'} lead: ${compradorNome}${tel ? ' tel:' + tel : ' (sem tel ainda)'}`);
+
+        // Notifica Telegram: novo lead OU lead acabou de mandar WhatsApp
+        const isNovoLead     = !deveAtualizar;
+        const chegouTelefone = deveAtualizar && tel && !lead.crmTemTelefone;
+        if (isNovoLead || chegouTelefone) {
+          const botNomes = { facebook1: 'Jhow', facebook2: 'João Moto Ride', facebook3: 'Lucas Moto Ride', facebook4: 'Bruna Moto Ride' };
+          const botNome  = botNomes[BOT_ID] || BOT_ID;
+          const veiculoLabel = veiculo ? `${veiculo.marca} ${veiculo.modelo} ${veiculo.ano}` : 'veículo desconhecido';
+          const linhasTel = tel ? `📞 <b>WhatsApp:</b> ${tel}` : `📭 Ainda sem telefone`;
+          const titulo = isNovoLead ? '🆕 Novo lead no Marketplace!' : '📱 Lead mandou WhatsApp!';
+          notificarTelegram(
+            `${titulo}\n👤 <b>${compradorNome}</b>\n🚗 ${veiculoLabel}\n${linhasTel}\n🤖 Bot: ${botNome}`
+          );
+        }
+
+        sincronizarLeadCRM(convId, compradorNome, veiculo, lead.historico, tel)
+          .then(id => {
+            if (id) {
+              // Relê leads do disco para evitar sobrescrever dados de outras conversas
+              const leadsAtual = loadJSON(LEADS_FILE);
+              const leadAtual  = leadsAtual[convId] || lead;
+              leadAtual.crmRegistrado  = true;
+              leadAtual.nome           = compradorNome;
+              leadAtual.vehicleLabel   = veiculo ? `${veiculo.marca} ${veiculo.modelo} ${veiculo.ano}` : null;
+              leadAtual.vehicleId      = veiculo?.id || null;
+              if (tel) leadAtual.crmTemTelefone = true;
+              leadAtual.crmLeadId = id;
+              leadsAtual[convId] = leadAtual;
+              saveJSON(LEADS_FILE, leadsAtual);
+            }
+          })
+          .catch(e => log.error(`[CRM] ${e.message}`));
+      }
     }
+
+    if (algumEnvioRealizado) await delayAleatorio();
   }
 
   return respostasNoCiclo;
@@ -1387,6 +1357,23 @@ async function processarConversa(page, ativos, convId, vehicleHint, modoClique, 
 
 // ── Ciclo principal ──────────────────────────────────────
 async function monitorar(page, context) {
+  // Limpeza diária: remove entradas com ultimaAtividade > 60 dias (4.4)
+  const hoje = new Date().toDateString();
+  if (ultimaLimpeza !== hoje) {
+    ultimaLimpeza = hoje;
+    const leadsAll = loadJSON(LEADS_FILE);
+    const antes    = Object.keys(leadsAll).length;
+    const limite   = Date.now() - 60 * 24 * 60 * 60 * 1000;
+    for (const [k, v] of Object.entries(leadsAll)) {
+      if (v.ultimaAtividade && new Date(v.ultimaAtividade).getTime() < limite) delete leadsAll[k];
+    }
+    const removidos = antes - Object.keys(leadsAll).length;
+    if (removidos > 0) {
+      saveJSON(LEADS_FILE, leadsAll);
+      log.info(`[Limpeza] ${removidos} entrada(s) removida(s) do JSON local (>60 dias)`);
+    }
+  }
+
   const vehicles = await carregarVeiculosSupabase();
   const ativos   = Object.values(vehicles).filter(v => v.status !== 'vendido');
   if (ativos.length === 0) { log.warn('Nenhum veículo ativo no estoque'); return page; }
@@ -1460,6 +1447,30 @@ async function monitorar(page, context) {
   } catch (e) {
     log.warn(`[FB] Erro ao clicar Marketplace: ${e.message}`);
   }
+
+  // Scroll no sidebar do inbox para garantir que conversas recentes estejam carregadas (4.2)
+  await page.evaluate(() => {
+    const s = document.querySelector('[role="navigation"]')
+      || document.querySelector('[aria-label*="Conversa" i]')
+      || [...document.querySelectorAll('div')].find(el => {
+           const r = el.getBoundingClientRect();
+           return r.left < 50 && r.width > 100 && r.width < 450 && r.height > 400 && el.scrollHeight > el.clientHeight;
+         })
+      || document.body;
+    s.scrollBy(0, 400);
+  });
+  await page.waitForTimeout(1000);
+  await page.evaluate(() => {
+    const s = document.querySelector('[role="navigation"]')
+      || document.querySelector('[aria-label*="Conversa" i]')
+      || [...document.querySelectorAll('div')].find(el => {
+           const r = el.getBoundingClientRect();
+           return r.left < 50 && r.width > 100 && r.width < 450 && r.height > 400 && el.scrollHeight > el.clientHeight;
+         })
+      || document.body;
+    s.scrollBy(0, 400);
+  });
+  await page.waitForTimeout(1000);
 
   await page.screenshot({ path: 'debug.png' });
 
